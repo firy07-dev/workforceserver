@@ -7,7 +7,8 @@ const multer = require('multer');
 const User = require('../models/User');
 const { auth } = require('../middleware/auth');
 
-const profilePhotoDir = path.join(__dirname, '../../uploads/profile-photos');
+const uploadRoot = process.env.UPLOAD_ROOT || path.join(__dirname, '../../uploads');
+const profilePhotoDir = path.join(uploadRoot, 'profile-photos');
 fs.mkdirSync(profilePhotoDir, { recursive: true });
 
 const storage = multer.diskStorage({
@@ -92,7 +93,7 @@ router.post('/profile/photo', auth, upload.single('photo'), async (req, res) => 
     }
 
     if (req.user.profilePhoto && req.user.profilePhoto.startsWith('/uploads/')) {
-      const oldPath = path.join(__dirname, '../..', req.user.profilePhoto);
+      const oldPath = path.join(uploadRoot, req.user.profilePhoto.replace(/^\/uploads\/?/, ''));
       fs.rm(oldPath, { force: true }, () => {});
     }
 
