@@ -95,6 +95,22 @@ const ensureSettings = async () => {
   return settings;
 };
 
+const ensureLeaveBalances = (user, settings) => {
+  if (!user.leaveBalances) user.leaveBalances = {};
+  user.leaveBalances.vacation = {
+    total: user.leaveBalances.vacation?.total ?? settings.vacationLeaveTotal ?? 12,
+    used: user.leaveBalances.vacation?.used ?? 0,
+  };
+  user.leaveBalances.sick = {
+    total: user.leaveBalances.sick?.total ?? settings.sickLeaveTotal ?? 6,
+    used: user.leaveBalances.sick?.used ?? 0,
+  };
+  user.leaveBalances.compOff = {
+    total: user.leaveBalances.compOff?.total ?? settings.compOffTotal ?? 0,
+    used: user.leaveBalances.compOff?.used ?? 0,
+  };
+};
+
 // Get all employees
 router.get('/employees', auth, admin, async (req, res) => {
   const employees = await User.find({ role: 'employee' });
@@ -104,6 +120,7 @@ router.get('/employees', auth, admin, async (req, res) => {
 // Create employee
 router.post('/employees', auth, admin, async (req, res) => {
   try {
+    const settings = await ensureSettings();
     const { email, employeeId } = req.body;
     const existingEmail = await User.findOne({ email: email.toLowerCase() });
     if (existingEmail) {
@@ -114,8 +131,16 @@ router.post('/employees', auth, admin, async (req, res) => {
     if (existingId) {
       return res.status(400).send({ error: 'Employee ID already in use' });
     }
-
-    const employee = new User({ ...req.body, email: email.toLowerCase(), role: 'employee' });
+    const employee = new User({
+      ...req.body,
+      email: email.toLowerCase(),
+      role: 'employee',
+      leaveBalances: {
+        vacation: { total: settings.vacationLeaveTotal ?? 12, used: 0 },
+        sick: { total: settings.sickLeaveTotal ?? 6, used: 0 },
+        compOff: { total: settings.compOffTotal ?? 0, used: 0 },
+      },
+    });
     await employee.save();
     res.status(201).send(employee);
   } catch (error) {
@@ -145,11 +170,38 @@ router.patch('/leaves/:id', auth, admin, async (req, res) => {
       return res.status(404).send({ error: 'Leave request not found' });
     }
 
+    const previousStatus = leave.status;
     if (status) {
       leave.status = status;
     }
     if (adminComment !== undefined) {
       leave.adminComment = adminComment;
+    }
+
+    const settings = await ensureSettings();
+    const employee = await User.findById(leave.userId?._id || leave.userId);
+    if (employee) {
+      ensureLeaveBalances(employee, settings);
+      const balanceKey = leave.type === 'vacation'
+        ? 'vacation'
+        : leave.type === 'sick'
+          ? 'sick'
+          : leave.type === 'compOff'
+            ? 'compOff'
+            : null;
+
+      if (balanceKey) {
+        const balance = employee.leaveBalances[balanceKey];
+        if (previousStatus !== 'approved' && leave.status === 'approved' && !leave.balanceApplied) {
+          balance.used += leave.totalDays || 0;
+          leave.balanceApplied = true;
+          await employee.save();
+        } else if (previousStatus === 'approved' && leave.status !== 'approved' && leave.balanceApplied) {
+          balance.used = Math.max(0, balance.used - (leave.totalDays || 0));
+          leave.balanceApplied = false;
+          await employee.save();
+        }
+      }
     }
 
     await leave.save();
@@ -284,6 +336,9 @@ router.get('/employees/:id/overview', auth, admin, async (req, res) => {
       return res.status(404).send({ error: 'Employee not found' });
     }
 
+    const settings = await ensureSettings();
+    ensureLeaveBalances(employee, settings);
+
     const now = nowInBusinessZone();
     const monthStart = now.startOf('month').toISODate();
     const monthEnd = now.endOf('month').toISODate();
@@ -313,7 +368,7 @@ router.get('/employees/:id/overview', auth, admin, async (req, res) => {
     const pendingLeaves = monthlyLeaves.filter((item) => item.status === 'pending').length;
     const approvedLeaves = monthlyLeaves.filter((item) => item.status === 'approved').length;
 
-    const leaveBreakdown = ['vacation', 'sick', 'emergency', 'other'].map((type) => ({
+    const leaveBreakdown = ['vacation', 'sick', 'compOff', 'emergency', 'other'].map((type) => ({
       type,
       count: monthlyLeaves.filter((item) => item.status === 'approved' && item.type === type).length,
     }));
@@ -383,6 +438,35 @@ router.get('/employees/:id/overview', auth, admin, async (req, res) => {
   }
 });
 
+router.post('/employees/:id/primary-device', auth, admin, async (req, res) => {
+  try {
+    const { deviceId, deviceName } = req.body;
+    if (!deviceId) {
+      return res.status(400).send({ error: 'Device ID is required' });
+    }
+
+    const employee = await User.findById(req.params.id);
+    if (!employee || employee.role !== 'employee') {
+      return res.status(404).send({ error: 'Employee not found' });
+    }
+
+    employee.primaryDevice = {
+      deviceId,
+      deviceName: deviceName || 'Unknown device',
+      assignedAt: new Date(),
+      lastSeenAt: new Date(),
+    };
+    await employee.save();
+
+    res.send({
+      message: 'Primary device updated',
+      primaryDevice: employee.primaryDevice,
+    });
+  } catch (error) {
+    res.status(400).send({ error: error.message || 'Failed to update primary device' });
+  }
+});
+
 router.post('/employees/:id/reset-password', auth, admin, async (req, res) => {
   try {
     const { password } = req.body;
@@ -412,7 +496,7 @@ router.patch('/attendance/:id', auth, admin, async (req, res) => {
       return res.status(404).send({ error: 'Attendance record not found' });
     }
 
-    const allowed = ['clockIn', 'clockOut', 'status', 'totalHours', 'overtime', 'breaks'];
+    const allowed = ['clockIn', 'clockOut', 'status', 'totalHours', 'overtime', 'shortHours', 'shortHoursReason', 'breaks'];
     allowed.forEach((field) => {
       if (req.body[field] !== undefined) {
         attendance[field] = req.body[field];
@@ -441,6 +525,9 @@ router.patch('/settings', auth, admin, async (req, res) => {
       'qrCodeValue',
       'dailyMinutes',
       'weeklyMinutes',
+      'vacationLeaveTotal',
+      'sickLeaveTotal',
+      'compOffTotal',
       'clockInWindowStart',
       'clockInWindowEnd',
       'clockOutEarliest',
@@ -459,6 +546,10 @@ router.patch('/settings', auth, admin, async (req, res) => {
         settings[field] = req.body[field];
       }
     });
+
+    if (req.body.regenerateQrSecret) {
+      settings.qrCodeValue = `OFFICE-${Date.now()}-${Math.random().toString(36).slice(2, 10).toUpperCase()}`;
+    }
 
     await settings.save();
     res.send(settings);

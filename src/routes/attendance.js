@@ -9,6 +9,12 @@ const { emitToAdmins, emitToUser } = require('../utils/realtime');
 
 const BUSINESS_TIMEZONE = process.env.APP_TIMEZONE || 'Asia/Kolkata';
 const nowInBusinessZone = () => DateTime.now().setZone(BUSINESS_TIMEZONE);
+const formatMinutesAsHours = (totalMinutes) => {
+  const safeMinutes = Math.max(0, Math.round(Number(totalMinutes) || 0));
+  const hours = Math.floor(safeMinutes / 60);
+  const minutes = safeMinutes % 60;
+  return `${hours}h ${minutes}m`;
+};
 
 const ensureSettings = async () => {
   let settings = await Setting.findOne();
@@ -47,20 +53,53 @@ const getDistanceMeters = (lat1, lon1, lat2, lon2) => {
   return R * c;
 };
 
-const withinRadius = (location, settings) => {
+const getLocationCheck = (location, settings) => {
   if (
     typeof settings.locationLatitude !== 'number'
     || typeof settings.locationLongitude !== 'number'
     || typeof settings.locationRadius !== 'number'
   ) {
-    return true;
+    return { allowed: true, distance: 0, radius: settings.locationRadius };
   }
-  return getDistanceMeters(
+  const distance = getDistanceMeters(
     settings.locationLatitude,
     settings.locationLongitude,
     location.latitude,
     location.longitude
-  ) <= settings.locationRadius;
+  );
+  return {
+    allowed: distance <= settings.locationRadius,
+    distance,
+    radius: settings.locationRadius,
+  };
+};
+
+const syncPrimaryDevice = async ({ user, deviceId, deviceName }) => {
+  if (!deviceId) {
+    return { mismatch: false, primaryDevice: user.primaryDevice || null };
+  }
+
+  if (!user.primaryDevice?.deviceId) {
+    user.primaryDevice = {
+      deviceId,
+      deviceName: deviceName || 'Unknown device',
+      assignedAt: new Date(),
+      lastSeenAt: new Date(),
+    };
+    await user.save();
+    return { mismatch: false, primaryDevice: user.primaryDevice };
+  }
+
+  const mismatch = user.primaryDevice.deviceId !== deviceId;
+  if (!mismatch) {
+    user.primaryDevice.lastSeenAt = new Date();
+    if (deviceName && user.primaryDevice.deviceName !== deviceName) {
+      user.primaryDevice.deviceName = deviceName;
+    }
+    await user.save();
+  }
+
+  return { mismatch, primaryDevice: user.primaryDevice };
 };
 
 // Get current status
@@ -92,9 +131,9 @@ router.post('/clock-in', auth, async (req, res) => {
     const settings = await ensureSettings();
 
     const currentMinutes = toMinutes(now);
-    if (!isWithinWindow(currentMinutes, settings.clockInWindowStart, settings.clockInWindowEnd)) {
+    if (currentMinutes < settings.clockInWindowStart) {
       return res.status(400).send({
-        error: `Clock-in is allowed only between ${toClockLabel(settings.clockInWindowStart)} and ${toClockLabel(settings.clockInWindowEnd)}`,
+        error: `Clock-in opens at ${toClockLabel(settings.clockInWindowStart)}`,
       });
     }
 
@@ -122,9 +161,21 @@ router.post('/clock-in', auth, async (req, res) => {
       }
     }
 
-    if (!withinRadius(req.body.location, settings)) {
-      return res.status(400).send({ error: 'Please clock in from the registered workplace location' });
+    const locationCheck = getLocationCheck(req.body.location, settings);
+    if (!locationCheck.allowed) {
+      return res.status(400).send({
+        error: 'Please clock in from the registered workplace location',
+        code: 'LOCATION_OUTSIDE_RADIUS',
+        distanceMeters: Math.round(locationCheck.distance),
+        allowedRadiusMeters: Math.round(locationCheck.radius),
+      });
     }
+
+    const deviceCheck = await syncPrimaryDevice({
+      user: req.user,
+      deviceId: req.body.deviceId || '',
+      deviceName: req.body.deviceName || '',
+    });
 
     record = new Attendance({
       userId: req.user._id,
@@ -140,13 +191,34 @@ router.post('/clock-in', auth, async (req, res) => {
       qrVerified: settings.attendanceMode === 'qr',
       deviceId: req.body.deviceId || '',
       deviceName: req.body.deviceName || '',
+      deviceMismatch: deviceCheck.mismatch,
       verificationStatus: 'verified'
     });
 
     await record.save();
 
-    const lateByMinutes = currentMinutes - settings.clockInWindowStart;
-    if (lateByMinutes > 5) {
+    if (deviceCheck.mismatch) {
+      try {
+        await notifyAdmins({
+          title: 'Device change detected',
+          body: `${req.user.name} (${req.user.employeeId}) clocked in from a different device: ${req.body.deviceName || 'Unknown device'}.`,
+          type: 'alert',
+          refModel: 'Attendance',
+          refId: record._id,
+          data: {
+            route: `/admin-detail/employee/${req.user._id}`,
+            attendanceId: String(record._id),
+            employeeId: req.user.employeeId,
+            deviceId: req.body.deviceId || '',
+          },
+        });
+      } catch (pushError) {
+        console.error('Device change notification failed:', pushError);
+      }
+    }
+
+    const lateByMinutes = Math.max(0, currentMinutes - settings.clockInWindowEnd);
+    if (lateByMinutes > 0) {
       try {
         await notifyAdmins({
           title: 'Late clock-in alert',
@@ -209,6 +281,28 @@ router.post('/clock-out', auth, async (req, res) => {
       return res.status(400).send({ error: 'Location is required for clock-out' });
     }
 
+    const locationCheck = getLocationCheck(req.body.location, settings);
+    if (!locationCheck.allowed) {
+      return res.status(400).send({
+        error: 'Please clock out from the registered workplace location',
+        code: 'LOCATION_OUTSIDE_RADIUS',
+        distanceMeters: Math.round(locationCheck.distance),
+        allowedRadiusMeters: Math.round(locationCheck.radius),
+      });
+    }
+
+    if (settings.attendanceMode === 'qr') {
+      if (!settings.qrCodeValue) {
+        return res.status(400).send({ error: 'QR attendance is not configured yet' });
+      }
+      if (!req.body.qrCodeValue) {
+        return res.status(400).send({ error: 'QR scan is required for clock-out' });
+      }
+      if (req.body.qrCodeValue !== settings.qrCodeValue) {
+        return res.status(400).send({ error: 'Invalid office QR code' });
+      }
+    }
+
     record.clockOut = {
       time: now.toJSDate(),
       location: req.body.location
@@ -232,13 +326,33 @@ router.post('/clock-out', auth, async (req, res) => {
     const workingMinutes = Math.max(0, duration - breakMinutes);
     record.totalHours = workingMinutes;
 
-    // Overtime: Standard is 8h 13m = 493 minutes
     const standardMinutes = settings.dailyMinutes || 493;
-    if (workingMinutes > standardMinutes) {
-      record.overtime = workingMinutes - standardMinutes;
+    record.overtime = Math.max(0, workingMinutes - standardMinutes);
+    record.shortHours = Math.max(0, standardMinutes - workingMinutes);
+    if (typeof req.body.shortHoursReason === 'string') {
+      record.shortHoursReason = req.body.shortHoursReason.trim();
     }
 
     await record.save();
+
+    if (record.shortHours > 0 && !record.emergencyLeaveApproved) {
+      try {
+        await notifyAdmins({
+          title: 'Short hours recorded',
+          body: `${req.user.name} (${req.user.employeeId}) clocked out with ${formatMinutesAsHours(record.shortHours)} short of the daily working hour.`,
+          type: 'alert',
+          refModel: 'Attendance',
+          refId: record._id,
+          data: {
+            route: '/(admin)/attendance_records',
+            attendanceId: String(record._id),
+            employeeId: req.user.employeeId,
+          },
+        });
+      } catch (pushError) {
+        console.error('Short-hours notification failed:', pushError);
+      }
+    }
     emitToUser(req.user._id, 'attendance:updated', {
       action: 'clock-out',
       attendanceId: String(record._id),

@@ -26,6 +26,7 @@ const AttendanceSchema = new mongoose.Schema({
   qrVerified: { type: Boolean, default: false },
   deviceId: { type: String, default: '' },
   deviceName: { type: String, default: '' },
+  deviceMismatch: { type: Boolean, default: false },
   verificationStatus: { type: String, enum: ['pending', 'verified', 'failed'], default: 'pending' },
   breaks: [{
     start: Date,
@@ -43,6 +44,8 @@ const AttendanceSchema = new mongoose.Schema({
   }],
   totalHours: { type: Number, default: 0 }, // In minutes
   overtime: { type: Number, default: 0 }, // In minutes
+  shortHours: { type: Number, default: 0 }, // In minutes
+  shortHoursReason: { type: String, default: '' },
   status: { type: String, enum: ['present', 'absent', 'on-leave', 'half-day', 'on-break'], default: 'present' },
   isEdited: { type: Boolean, default: false },
   modifiedBy: { type: mongoose.Schema.Types.ObjectId, ref: 'User' },

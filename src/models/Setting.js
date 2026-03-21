@@ -3,6 +3,9 @@ const mongoose = require('mongoose');
 const SettingSchema = new mongoose.Schema({
   dailyMinutes: { type: Number, default: 493 }, // 8h13m
   weeklyMinutes: { type: Number, default: 5 * 493 },
+  vacationLeaveTotal: { type: Number, default: 12 },
+  sickLeaveTotal: { type: Number, default: 6 },
+  compOffTotal: { type: Number, default: 0 },
   attendanceMode: { type: String, enum: ['selfie', 'qr'], default: 'selfie' },
   qrCodeValue: { type: String, default: '' },
   clockInWindowStart: { type: Number, default: 6 * 60 },

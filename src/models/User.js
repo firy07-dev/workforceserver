@@ -1,6 +1,18 @@
 const mongoose = require('mongoose');
 const bcrypt = require('bcryptjs');
 
+const LeaveBalanceSchema = new mongoose.Schema({
+  total: { type: Number, default: 0 },
+  used: { type: Number, default: 0 },
+}, { _id: false });
+
+const PrimaryDeviceSchema = new mongoose.Schema({
+  deviceId: { type: String, default: '' },
+  deviceName: { type: String, default: '' },
+  assignedAt: { type: Date, default: Date.now },
+  lastSeenAt: { type: Date, default: Date.now },
+}, { _id: false });
+
 const UserSchema = new mongoose.Schema({
   name: { type: String, required: true },
   email: { type: String, required: true, unique: true },
@@ -11,6 +23,12 @@ const UserSchema = new mongoose.Schema({
   designation: String,
   joinDate: { type: Date, default: Date.now },
   profilePhoto: String,
+  leaveBalances: {
+    vacation: { type: LeaveBalanceSchema, default: () => ({ total: 0, used: 0 }) },
+    sick: { type: LeaveBalanceSchema, default: () => ({ total: 0, used: 0 }) },
+    compOff: { type: LeaveBalanceSchema, default: () => ({ total: 0, used: 0 }) },
+  },
+  primaryDevice: { type: PrimaryDeviceSchema, default: null },
   pushTokens: [{
     token: { type: String, required: true },
     platform: { type: String, enum: ['ios', 'android', 'web'], default: 'android' },
