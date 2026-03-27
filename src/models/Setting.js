@@ -11,6 +11,7 @@ const SettingSchema = new mongoose.Schema({
   clockInWindowStart: { type: Number, default: 6 * 60 },
   clockInWindowEnd: { type: Number, default: 10 * 60 },
   clockOutEarliest: { type: Number, default: 15 * 60 },
+  overtimeGraceMinutes: { type: Number, default: 60 },
   lunchBreakStart: { type: Number, default: 11 * 60 + 30 },
   lunchBreakEnd: { type: Number, default: 12 * 60 + 30 },
   lunchMinimumMinutes: { type: Number, default: 30 },

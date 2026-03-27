@@ -531,6 +531,7 @@ router.patch('/settings', auth, admin, async (req, res) => {
       'clockInWindowStart',
       'clockInWindowEnd',
       'clockOutEarliest',
+      'overtimeGraceMinutes',
       'lunchBreakStart',
       'lunchBreakEnd',
       'lunchMinimumMinutes',

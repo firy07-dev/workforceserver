@@ -36,6 +36,7 @@ const isWithinWindow = (currentMinutes, startMinutes, endMinutes) => {
   }
   return currentMinutes >= startMinutes || currentMinutes <= endMinutes;
 };
+const withMinutesOnDate = (baseDateTime, totalMinutes) => baseDateTime.startOf('day').plus({ minutes: totalMinutes });
 
 const getDistanceMeters = (lat1, lon1, lat2, lon2) => {
   const toRad = (value) => (value * Math.PI) / 180;
@@ -118,6 +119,7 @@ router.get('/config', auth, async (req, res) => {
     clockInWindowStart: settings.clockInWindowStart,
     clockInWindowEnd: settings.clockInWindowEnd,
     clockOutEarliest: settings.clockOutEarliest,
+    overtimeGraceMinutes: settings.overtimeGraceMinutes,
     lunchBreakStart: settings.lunchBreakStart,
     lunchBreakEnd: settings.lunchBreakEnd,
     lunchMinimumMinutes: settings.lunchMinimumMinutes,
@@ -308,10 +310,12 @@ router.post('/clock-out', auth, async (req, res) => {
       location: req.body.location
     };
 
-    // Calculate total hours
-    const clockInTime = DateTime.fromJSDate(record.clockIn.time);
+    // Calculate total hours from the effective shift start; early arrival before shift start does not count.
+    const actualClockInTime = DateTime.fromJSDate(record.clockIn.time).setZone(BUSINESS_TIMEZONE);
+    const shiftStartTime = withMinutesOnDate(now, settings.clockInWindowStart || 0);
+    const effectiveClockInTime = actualClockInTime < shiftStartTime ? shiftStartTime : actualClockInTime;
     const clockOutTime = now;
-    const duration = clockOutTime.diff(clockInTime, 'minutes').minutes;
+    const duration = clockOutTime.diff(effectiveClockInTime, 'minutes').minutes;
 
     // Subtract breaks; default to the configured lunch minimum (30 min) when no break is recorded
     let actualBreakMinutes = 0;
@@ -327,7 +331,11 @@ router.post('/clock-out', auth, async (req, res) => {
     record.totalHours = workingMinutes;
 
     const standardMinutes = settings.dailyMinutes || 493;
-    record.overtime = Math.max(0, workingMinutes - standardMinutes);
+    const overtimeGraceMinutes = typeof settings.overtimeGraceMinutes === 'number' ? settings.overtimeGraceMinutes : 60;
+    const overtimeThresholdTime = withMinutesOnDate(now, (settings.clockOutEarliest || 0) + overtimeGraceMinutes);
+    record.overtime = clockOutTime >= overtimeThresholdTime
+      ? Math.max(0, Math.round(clockOutTime.diff(withMinutesOnDate(now, settings.clockOutEarliest || 0), 'minutes').minutes))
+      : 0;
     record.shortHours = Math.max(0, standardMinutes - workingMinutes);
     if (typeof req.body.shortHoursReason === 'string') {
       record.shortHoursReason = req.body.shortHoursReason.trim();
