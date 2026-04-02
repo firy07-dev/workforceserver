@@ -19,6 +19,8 @@ const UserSchema = new mongoose.Schema({
   password: { type: String, required: true },
   role: { type: String, enum: ['admin', 'employee'], default: 'employee' },
   employeeId: { type: String, unique: true, required: true },
+  phoneNumber: { type: String },
+  gender: { type: String },
   department: String,
   designation: String,
   joinDate: { type: Date, default: Date.now },

@@ -274,7 +274,7 @@ router.patch('/leaves/:id', auth, admin, async (req, res) => {
 
 router.patch('/employees/:id', auth, admin, async (req, res) => {
   try {
-    const allowed = ['name', 'email', 'department', 'designation', 'employeeId', 'isActive'];
+    const allowed = ['name', 'email', 'department', 'designation', 'employeeId', 'phoneNumber', 'gender', 'isActive'];
     const updates = {};
     allowed.forEach((field) => {
       if (req.body[field] !== undefined) {
