@@ -37,7 +37,9 @@ const UserSchema = new mongoose.Schema({
     updatedAt: { type: Date, default: Date.now },
   }],
   isActive: { type: Boolean, default: true },
-  mustChangePassword: { type: Boolean, default: false }
+  mustChangePassword: { type: Boolean, default: false },
+  resetPasswordCodeHash: { type: String },
+  resetPasswordExpiresAt: { type: Date }
 }, { timestamps: true });
 
 UserSchema.pre('save', async function() {

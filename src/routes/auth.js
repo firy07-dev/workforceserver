@@ -4,8 +4,10 @@ const jwt = require('jsonwebtoken');
 const path = require('path');
 const fs = require('fs');
 const multer = require('multer');
+const crypto = require('crypto');
 const User = require('../models/User');
 const { auth } = require('../middleware/auth');
+const { sendMail } = require('../utils/mailer');
 
 const uploadRoot = process.env.UPLOAD_ROOT || path.join(__dirname, '../../uploads');
 const profilePhotoDir = path.join(uploadRoot, 'profile-photos');
@@ -37,6 +39,14 @@ const getSeedAdminConfig = () => ({
   password: process.env.ADMIN_SEED_PASSWORD,
   employeeId: process.env.ADMIN_SEED_EMPLOYEE_ID || 'ADM001',
 });
+
+const generateResetCode = () => {
+  return String(Math.floor(100000 + Math.random() * 900000));
+};
+
+const hashResetCode = (code) => {
+  return crypto.createHash('sha256').update(code).digest('hex');
+};
 
 // Login
 router.post('/login', async (req, res) => {
@@ -131,6 +141,78 @@ router.post('/change-password', auth, async (req, res) => {
     res.send({ user: toSafeUser(user) });
   } catch (error) {
     res.status(400).send({ error: error.message || 'Failed to change password' });
+  }
+});
+
+// Forgot password (admin only)
+router.post('/forgot-password', async (req, res) => {
+  try {
+    const email = String(req.body.email || '').trim().toLowerCase();
+    if (!email) return res.status(400).send({ error: 'Email is required' });
+
+    const user = await User.findOne({ email });
+    if (!user || user.role !== 'admin') {
+      return res.status(400).send({ error: 'Contact your administrator to reset your password' });
+    }
+
+    const code = generateResetCode();
+    user.resetPasswordCodeHash = hashResetCode(code);
+    user.resetPasswordExpiresAt = new Date(Date.now() + 15 * 60 * 1000);
+    await user.save();
+
+    await sendMail({
+      to: user.email,
+      subject: 'Workforce LMS password reset code',
+      text: `Your password reset code is ${code}. This code expires in 15 minutes.`,
+    });
+
+    res.send({ message: 'Reset code sent' });
+  } catch (error) {
+    res.status(400).send({ error: error.message || 'Failed to send reset code' });
+  }
+});
+
+// Reset password with code (admin only)
+router.post('/reset-password', async (req, res) => {
+  try {
+    const email = String(req.body.email || '').trim().toLowerCase();
+    const code = String(req.body.code || '').trim();
+    const newPassword = String(req.body.newPassword || '').trim();
+
+    if (!email || !code || !newPassword) {
+      return res.status(400).send({ error: 'Email, code, and new password are required' });
+    }
+    if (newPassword.length < 6) {
+      return res.status(400).send({ error: 'New password must be at least 6 characters' });
+    }
+
+    const user = await User.findOne({ email });
+    if (!user || user.role !== 'admin') {
+      return res.status(400).send({ error: 'Contact your administrator to reset your password' });
+    }
+
+    if (!user.resetPasswordCodeHash || !user.resetPasswordExpiresAt) {
+      return res.status(400).send({ error: 'Reset code is not available' });
+    }
+
+    if (user.resetPasswordExpiresAt.getTime() < Date.now()) {
+      return res.status(400).send({ error: 'Reset code has expired' });
+    }
+
+    const match = hashResetCode(code) === user.resetPasswordCodeHash;
+    if (!match) {
+      return res.status(400).send({ error: 'Invalid reset code' });
+    }
+
+    user.password = newPassword;
+    user.mustChangePassword = false;
+    user.resetPasswordCodeHash = undefined;
+    user.resetPasswordExpiresAt = undefined;
+    await user.save();
+
+    res.send({ message: 'Password updated' });
+  } catch (error) {
+    res.status(400).send({ error: error.message || 'Failed to reset password' });
   }
 });
 
