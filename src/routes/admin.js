@@ -11,6 +11,52 @@ const { emitToAdmins, emitToUser } = require('../utils/realtime');
 
 const BUSINESS_TIMEZONE = process.env.APP_TIMEZONE || 'Asia/Kolkata';
 const nowInBusinessZone = () => DateTime.now().setZone(BUSINESS_TIMEZONE);
+const withMinutesOnDate = (baseDateTime, totalMinutes) => baseDateTime.startOf('day').plus({ minutes: totalMinutes });
+const parseDateTimeInput = (dateValue, timeValue) => {
+  const dateStr = String(dateValue || nowInBusinessZone().toISODate() || '').trim();
+  const timeStr = String(timeValue || '').trim();
+
+  if (!dateStr) {
+    throw new Error('date is required');
+  }
+  if (!timeStr) {
+    throw new Error('time is required');
+  }
+
+  const normalizedTime = /^\d{2}:\d{2}(:\d{2})?$/.test(timeStr) ? timeStr : null;
+  if (!normalizedTime) {
+    throw new Error('time must be in HH:mm format');
+  }
+
+  const dt = DateTime.fromISO(`${dateStr}T${normalizedTime.length === 5 ? `${normalizedTime}:00` : normalizedTime}`, {
+    zone: BUSINESS_TIMEZONE,
+  });
+  if (!dt.isValid) {
+    throw new Error('Invalid date or time');
+  }
+  return dt;
+};
+
+const calculateManualAttendance = ({ clockInTime, clockOutTime, lunchMinutes, settings }) => {
+  const shiftStartTime = withMinutesOnDate(clockInTime, settings.clockInWindowStart || 0);
+  const effectiveClockInTime = clockInTime < shiftStartTime ? shiftStartTime : clockInTime;
+
+  const duration = clockOutTime.diff(effectiveClockInTime, 'minutes').minutes;
+  const defaultLunchDeduction = settings.lunchMinimumMinutes || 30;
+  const breakMinutes = typeof lunchMinutes === 'number' && lunchMinutes >= 0
+    ? lunchMinutes
+    : defaultLunchDeduction;
+  const workingMinutes = Math.max(0, duration - breakMinutes);
+  const standardMinutes = settings.dailyMinutes || 493;
+  const overtimeGraceMinutes = typeof settings.overtimeGraceMinutes === 'number' ? settings.overtimeGraceMinutes : 60;
+  const overtimeThresholdTime = withMinutesOnDate(clockOutTime, (settings.clockOutEarliest || 0) + overtimeGraceMinutes);
+  const overtime = clockOutTime >= overtimeThresholdTime
+    ? Math.max(0, Math.round(clockOutTime.diff(withMinutesOnDate(clockOutTime, settings.clockOutEarliest || 0), 'minutes').minutes))
+    : 0;
+  const shortHours = Math.max(0, standardMinutes - workingMinutes);
+
+  return { breakMinutes, workingMinutes, overtime, shortHours };
+};
 
 const buildRecentActivity = async () => {
   const [attendanceRecords, leaveRequests] = await Promise.all([
@@ -34,7 +80,7 @@ const buildRecentActivity = async () => {
         actorEmployeeId: record.userId?.employeeId || '',
         timestamp: record.clockIn.time,
         description: `${record.userId?.name || 'Unknown'} clocked in`,
-        meta: record.verificationMethod === 'qr' ? 'QR' : 'Selfie',
+        meta: record.verificationMethod === 'manual' ? 'Manual' : record.verificationMethod === 'qr' ? 'QR' : 'Selfie',
       });
     }
     if (record.clockOut?.time) {
@@ -496,7 +542,7 @@ router.patch('/attendance/:id', auth, admin, async (req, res) => {
       return res.status(404).send({ error: 'Attendance record not found' });
     }
 
-    const allowed = ['clockIn', 'clockOut', 'status', 'totalHours', 'overtime', 'shortHours', 'shortHoursReason', 'breaks'];
+    const allowed = ['clockIn', 'clockOut', 'status', 'totalHours', 'overtime', 'shortHours', 'shortHoursReason', 'breaks', 'manualEntry', 'manualReason', 'manualLunchMinutes'];
     allowed.forEach((field) => {
       if (req.body[field] !== undefined) {
         attendance[field] = req.body[field];
@@ -509,6 +555,141 @@ router.patch('/attendance/:id', auth, admin, async (req, res) => {
     res.send(attendance);
   } catch (error) {
     res.status(400).send({ error: error.message || 'Failed to update attendance' });
+  }
+});
+
+router.post('/attendance/manual', auth, admin, async (req, res) => {
+  try {
+    const { userId, date, clockInTime, clockOutTime, lunchMinutes, reason } = req.body || {};
+    if (!userId) {
+      return res.status(400).send({ error: 'userId is required' });
+    }
+
+    const employee = await User.findById(userId);
+    if (!employee || employee.role !== 'employee') {
+      return res.status(404).send({ error: 'Employee not found' });
+    }
+
+    const settings = await ensureSettings();
+    const attendanceDate = String(date || nowInBusinessZone().toISODate() || '').trim();
+    if (!attendanceDate) {
+      return res.status(400).send({ error: 'date is required' });
+    }
+
+    const hasClockOut = typeof clockOutTime === 'string' && clockOutTime.trim().length > 0;
+    const hasClockIn = typeof clockInTime === 'string' && clockInTime.trim().length > 0;
+    const targetClockIn = hasClockIn ? parseDateTimeInput(attendanceDate, clockInTime) : nowInBusinessZone();
+    const targetClockOut = hasClockOut ? parseDateTimeInput(attendanceDate, clockOutTime) : null;
+
+    if (targetClockOut && targetClockOut < targetClockIn) {
+      return res.status(400).send({ error: 'Clock-out cannot be earlier than clock-in' });
+    }
+
+    const normalizedLunch = Number.isFinite(Number(lunchMinutes))
+      ? Math.max(0, parseInt(lunchMinutes, 10))
+      : settings.lunchMinimumMinutes || 30;
+
+    const existingAttendance = await Attendance.findOne({ userId, date: attendanceDate });
+    const wasNew = !existingAttendance;
+    const attendance = existingAttendance || new Attendance({ userId, date: attendanceDate });
+
+    attendance.clockIn = attendance.clockIn || {};
+    attendance.clockIn.time = targetClockIn.toJSDate();
+    attendance.clockIn.location = {
+      latitude: settings.locationLatitude,
+      longitude: settings.locationLongitude,
+      address: settings.locationName || settings.locationAddress || 'Manual admin entry',
+    };
+
+    attendance.photoCaptured = false;
+    attendance.locationVerified = true;
+    attendance.verificationMethod = 'manual';
+    attendance.qrVerified = false;
+    attendance.deviceId = 'MANUAL';
+    attendance.deviceName = 'Admin Manual Entry';
+    attendance.deviceMismatch = false;
+    attendance.verificationStatus = 'verified';
+    attendance.status = 'present';
+    attendance.manualEntry = true;
+    attendance.manualReason = String(reason || '').trim();
+    attendance.manualLunchMinutes = normalizedLunch;
+    attendance.manualCreatedBy = attendance.manualCreatedBy || req.user._id;
+    attendance.manualCreatedAt = attendance.manualCreatedAt || nowInBusinessZone().toJSDate();
+    attendance.isEdited = true;
+    attendance.modifiedBy = req.user._id;
+
+    if (targetClockOut) {
+      attendance.clockOut = attendance.clockOut || {};
+      attendance.clockOut.time = targetClockOut.toJSDate();
+      attendance.clockOut.location = {
+        latitude: settings.locationLatitude,
+        longitude: settings.locationLongitude,
+        address: settings.locationName || settings.locationAddress || 'Manual admin entry',
+      };
+      attendance.breaks = [];
+
+      const { workingMinutes, overtime, shortHours } = calculateManualAttendance({
+        clockInTime: targetClockIn,
+        clockOutTime: targetClockOut,
+        lunchMinutes: normalizedLunch,
+        settings,
+      });
+
+      attendance.totalHours = workingMinutes;
+      attendance.overtime = overtime;
+      attendance.shortHours = shortHours;
+    } else {
+      attendance.clockOut = undefined;
+      attendance.breaks = [];
+      attendance.totalHours = 0;
+      attendance.overtime = 0;
+      attendance.shortHours = 0;
+      attendance.shortHoursReason = '';
+    }
+
+    if (attendance.shortHours > 0 && !attendance.shortHoursReason && reason) {
+      attendance.shortHoursReason = String(reason).trim();
+    }
+
+    await attendance.save();
+
+    try {
+      await notifyUserById(userId, {
+        title: 'Attendance updated by admin',
+        body: targetClockOut
+          ? 'Your attendance was manually corrected by an administrator.'
+          : 'Your attendance was manually marked present by an administrator.',
+        type: 'policy',
+        refModel: 'Attendance',
+        refId: attendance._id,
+        data: {
+          route: '/(employee)/attendance',
+          attendanceId: String(attendance._id),
+          date: attendanceDate,
+          manual: true,
+        },
+      });
+    } catch (pushError) {
+      console.error('Manual attendance notification failed:', pushError);
+    }
+
+    emitToUser(userId, 'attendance:updated', {
+      action: 'manual-attendance',
+      attendanceId: String(attendance._id),
+      date: attendanceDate,
+    });
+    emitToAdmins('attendance:updated', {
+      action: 'manual-attendance',
+      attendanceId: String(attendance._id),
+      userId: String(userId),
+      date: attendanceDate,
+    });
+    emitToAdmins('dashboard:refresh', { reason: 'manual-attendance' });
+
+    res.status(wasNew ? 201 : 200).send(attendance);
+  } catch (error) {
+    console.error('Manual attendance error:', error);
+    res.status(400).send({ error: error.message || 'Failed to save manual attendance' });
   }
 });
 

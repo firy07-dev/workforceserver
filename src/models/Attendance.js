@@ -22,7 +22,7 @@ const AttendanceSchema = new mongoose.Schema({
   },
   photoCaptured: { type: Boolean, default: false },
   locationVerified: { type: Boolean, default: false },
-  verificationMethod: { type: String, enum: ['selfie', 'qr'], default: 'selfie' },
+  verificationMethod: { type: String, enum: ['selfie', 'qr', 'manual'], default: 'qr' },
   qrVerified: { type: Boolean, default: false },
   deviceId: { type: String, default: '' },
   deviceName: { type: String, default: '' },
@@ -46,6 +46,11 @@ const AttendanceSchema = new mongoose.Schema({
   overtime: { type: Number, default: 0 }, // In minutes
   shortHours: { type: Number, default: 0 }, // In minutes
   shortHoursReason: { type: String, default: '' },
+  manualEntry: { type: Boolean, default: false },
+  manualReason: { type: String, default: '' },
+  manualLunchMinutes: { type: Number, default: 0 },
+  manualCreatedBy: { type: mongoose.Schema.Types.ObjectId, ref: 'User' },
+  manualCreatedAt: { type: Date },
   status: { type: String, enum: ['present', 'absent', 'on-leave', 'half-day', 'on-break'], default: 'present' },
   isEdited: { type: Boolean, default: false },
   modifiedBy: { type: mongoose.Schema.Types.ObjectId, ref: 'User' },
