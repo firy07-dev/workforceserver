@@ -10,6 +10,7 @@ const attendanceRoutes = require('./src/routes/attendance');
 const leaveRoutes = require('./src/routes/leave');
 const adminRoutes = require('./src/routes/admin');
 const notificationRoutes = require('./src/routes/notifications');
+const payoutRoutes = require('./src/routes/payout');
 const { initRealtime } = require('./src/utils/realtime');
 
 const app = express();
@@ -39,6 +40,7 @@ app.use('/api/attendance', attendanceRoutes);
 app.use('/api/leave', leaveRoutes);
 app.use('/api/admin', adminRoutes);
 app.use('/api/notifications', notificationRoutes);
+app.use('/api/payout', payoutRoutes);
 
 async function startServer() {
   if (!MONGODB_URL) {

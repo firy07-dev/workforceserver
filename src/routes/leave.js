@@ -14,16 +14,26 @@ const ensureSettings = async () => {
   return settings;
 };
 
-const withLeaveBalances = (user, settings) => {
+const { getTimeBankBalance } = require('../utils/timeBankLedger');
+
+const withLeaveBalances = async (user, settings) => {
   const balances = user?.leaveBalances || {};
   const vacation = balances.vacation || { total: settings.vacationLeaveTotal ?? 12, used: 0 };
   const sick = balances.sick || { total: settings.sickLeaveTotal ?? 6, used: 0 };
-  const compOff = balances.compOff || { total: settings.compOffTotal ?? 0, used: 0 };
+  
+  // CompOff balance is dynamically pulled from the Time Bank Ledger
+  const timeBankMinutes = await getTimeBankBalance(user._id);
+  const timeBankDays = Math.max(0, timeBankMinutes / (settings.dailyTargetMinutes || 493));
 
   return {
     vacation: { ...vacation, remaining: Math.max(0, (vacation.total || 0) - (vacation.used || 0)) },
     sick: { ...sick, remaining: Math.max(0, (sick.total || 0) - (sick.used || 0)) },
-    compOff: { ...compOff, remaining: Math.max(0, (compOff.total || 0) - (compOff.used || 0)) },
+    compOff: { 
+      total: Math.floor(timeBankDays * 10) / 10, 
+      used: 0, 
+      remaining: Math.floor(timeBankDays * 10) / 10,
+      unit: 'days' 
+    },
   };
 };
 
@@ -98,7 +108,7 @@ router.get('/my-requests', auth, async (req, res) => {
   ]);
   res.send({
     requests,
-    balances: withLeaveBalances(user, settings),
+    balances: await withLeaveBalances(user, settings),
   });
 });
 

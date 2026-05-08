@@ -4,14 +4,29 @@ const { auth, admin } = require('../middleware/auth');
 const User = require('../models/User');
 const Attendance = require('../models/Attendance');
 const LeaveRequest = require('../models/LeaveRequest');
+const TimeBankEntry = require('../models/TimeBankEntry');
 const Setting = require('../models/Setting');
+const Holiday = require('../models/Holiday');
+const PayoutRequest = require('../models/PayoutRequest');
 const { DateTime } = require('luxon');
 const { notifyUserById } = require('../utils/pushNotifications');
 const { emitToAdmins, emitToUser } = require('../utils/realtime');
+const {
+  calculateAttendanceTotals,
+  getScheduleMode,
+} = require('../utils/attendancePolicy');
+const {
+  syncAttendanceLedgerEntry,
+  createManualAdjustmentEntry,
+  getTimeBankBalance,
+  getTimeBankEntries,
+  syncHolidayLedgerEntry,
+  syncLeaveLedgerEntry,
+  syncPayoutLedgerEntry,
+} = require('../utils/timeBankLedger');
 
 const BUSINESS_TIMEZONE = process.env.APP_TIMEZONE || 'Asia/Kolkata';
 const nowInBusinessZone = () => DateTime.now().setZone(BUSINESS_TIMEZONE);
-const withMinutesOnDate = (baseDateTime, totalMinutes) => baseDateTime.startOf('day').plus({ minutes: totalMinutes });
 const parseDateTimeInput = (dateValue, timeValue) => {
   const dateStr = String(dateValue || nowInBusinessZone().toISODate() || '').trim();
   const timeStr = String(timeValue || '').trim();
@@ -37,37 +52,49 @@ const parseDateTimeInput = (dateValue, timeValue) => {
   return dt;
 };
 
-const calculateManualAttendance = ({ clockInTime, clockOutTime, lunchMinutes, settings }) => {
-  const shiftStartTime = withMinutesOnDate(clockInTime, settings.clockInWindowStart || 0);
-  const effectiveClockInTime = clockInTime < shiftStartTime ? shiftStartTime : clockInTime;
-
-  const duration = clockOutTime.diff(effectiveClockInTime, 'minutes').minutes;
-  const defaultLunchDeduction = settings.lunchMinimumMinutes || 30;
-  const breakMinutes = typeof lunchMinutes === 'number' && lunchMinutes >= 0
+const calculateManualAttendance = ({ employee, clockInTime, clockOutTime, lunchMinutes, settings }) => {
+  const normalizedLunch = typeof lunchMinutes === 'number' && lunchMinutes >= 0
     ? lunchMinutes
-    : defaultLunchDeduction;
-  const workingMinutes = Math.max(0, duration - breakMinutes);
-  const standardMinutes = settings.dailyMinutes || 493;
-  const overtimeGraceMinutes = typeof settings.overtimeGraceMinutes === 'number' ? settings.overtimeGraceMinutes : 60;
-  const overtimeThresholdTime = withMinutesOnDate(clockOutTime, (settings.clockOutEarliest || 0) + overtimeGraceMinutes);
-  const overtime = clockOutTime >= overtimeThresholdTime
-    ? Math.max(0, Math.round(clockOutTime.diff(withMinutesOnDate(clockOutTime, settings.clockOutEarliest || 0), 'minutes').minutes))
-    : 0;
-  const shortHours = Math.max(0, standardMinutes - workingMinutes);
+    : settings.lunchMinimumMinutes || 30;
+  const breakSpan = normalizedLunch > 0
+    ? [{ start: clockInTime.toJSDate(), end: clockInTime.plus({ minutes: normalizedLunch }).toJSDate() }]
+    : [];
 
-  return { breakMinutes, workingMinutes, overtime, shortHours };
+  const totals = calculateAttendanceTotals({
+    employee,
+    settings,
+    clockInTime,
+    clockOutTime,
+    breaks: breakSpan,
+    breakMinutesOverride: normalizedLunch,
+  });
+
+  return { breakMinutes: normalizedLunch, workingMinutes: totals.workingMinutes, overtime: totals.overtime, shortHours: totals.shortHours };
 };
 
-const buildRecentActivity = async () => {
-  const [attendanceRecords, leaveRequests] = await Promise.all([
-    Attendance.find({})
+const buildRecentActivity = async (options = {}) => {
+  const { limit = 20, start, end } = options;
+  
+  const query = {};
+  if (start || end) {
+    query.createdAt = {};
+    if (start) query.createdAt.$gte = new Date(start);
+    if (end) query.createdAt.$lte = new Date(end);
+  }
+
+  const [attendanceRecords, leaveRequests, timeBankEntries] = await Promise.all([
+    Attendance.find(query)
       .populate('userId', 'name employeeId')
-      .sort({ updatedAt: -1 })
-      .limit(20),
-    LeaveRequest.find({})
+      .sort({ createdAt: -1 })
+      .limit(limit),
+    LeaveRequest.find(query)
       .populate('userId', 'name employeeId')
-      .sort({ updatedAt: -1 })
-      .limit(20),
+      .sort({ createdAt: -1 })
+      .limit(limit),
+    TimeBankEntry.find(query)
+      .populate('userId', 'name employeeId')
+      .sort({ createdAt: -1 })
+      .limit(limit),
   ]);
 
   const attendanceEvents = attendanceRecords.flatMap((record) => {
@@ -124,14 +151,26 @@ const buildRecentActivity = async () => {
     return [createdEvent, ...decisionEvent];
   });
 
-  return [...attendanceEvents, ...leaveEvents]
-    .sort((a, b) => new Date(b.timestamp).getTime() - new Date(a.timestamp).getTime())
-    .slice(0, 10)
-    .map((event) => ({
-      ...event,
-      timestamp: event.timestamp,
-    }));
+  const timeBankEvents = timeBankEntries.flatMap((entry) => {
+    const minutes = Math.abs(entry.deltaMinutes || 0);
+    const signed = entry.deltaMinutes >= 0 ? '+' : '-';
+    return [{
+      id: `time-bank-${entry._id}`,
+      type: entry.sourceType === 'manual-adjustment' ? 'time-bank-adjustment' : 'time-bank',
+      actorName: entry.userId?.name || 'Unknown',
+      actorEmployeeId: entry.userId?.employeeId || '',
+      timestamp: entry.createdAt,
+      description: `${entry.userId?.name || 'Unknown'}'s bank adjusted (${signed}${minutes} min)`,
+      meta: entry.note || entry.sourceType,
+    }];
+  });
+
+  const allEvents = [...attendanceEvents, ...leaveEvents, ...timeBankEvents]
+    .sort((a, b) => new Date(b.timestamp).getTime() - new Date(a.timestamp).getTime());
+
+  return allEvents.slice(0, limit);
 };
+
 
 const ensureSettings = async () => {
   let settings = await Setting.findOne();
@@ -181,6 +220,9 @@ router.post('/employees', auth, admin, async (req, res) => {
       ...req.body,
       email: email.toLowerCase(),
       role: 'employee',
+      contractPercentage: Number.isFinite(Number(req.body.contractPercentage))
+        ? Math.min(100, Math.max(1, Math.round(Number(req.body.contractPercentage))))
+        : 100,
       leaveBalances: {
         vacation: { total: settings.vacationLeaveTotal ?? 12, used: 0 },
         sick: { total: settings.sickLeaveTotal ?? 6, used: 0 },
@@ -188,6 +230,18 @@ router.post('/employees', auth, admin, async (req, res) => {
       },
     });
     await employee.save();
+
+    // Credit future holidays for this new employee
+    const futureHolidays = await Holiday.find({ date: { $gte: nowInBusinessZone().toISODate() } });
+    await Promise.all(futureHolidays.map(holiday => 
+      syncHolidayLedgerEntry({
+        holiday,
+        employee,
+        settings,
+        createdBy: req.user._id
+      })
+    ));
+
     res.status(201).send(employee);
   } catch (error) {
     console.error('Create Employee Error:', error);
@@ -272,6 +326,16 @@ router.patch('/leaves/:id', auth, admin, async (req, res) => {
       }));
     }
 
+    // Sync with Time Bank Ledger if it's a CompOff leave
+    if (employee) {
+      await syncLeaveLedgerEntry({
+        leave,
+        employee,
+        settings,
+        createdBy: req.user._id,
+      });
+    }
+
     try {
       const approved = leave.status === 'approved';
       const title = leave.isEmergency && approved
@@ -320,7 +384,7 @@ router.patch('/leaves/:id', auth, admin, async (req, res) => {
 
 router.patch('/employees/:id', auth, admin, async (req, res) => {
   try {
-    const allowed = ['name', 'email', 'department', 'designation', 'employeeId', 'phoneNumber', 'gender', 'isActive'];
+    const allowed = ['name', 'email', 'department', 'designation', 'employeeId', 'phoneNumber', 'gender', 'isActive', 'contractPercentage'];
     const updates = {};
     allowed.forEach((field) => {
       if (req.body[field] !== undefined) {
@@ -341,6 +405,14 @@ router.patch('/employees/:id', auth, admin, async (req, res) => {
       if (existingId) {
         return res.status(400).send({ error: 'Employee ID already in use' });
       }
+    }
+
+    if (updates.contractPercentage !== undefined) {
+      const parsed = Number(updates.contractPercentage);
+      if (!Number.isFinite(parsed) || parsed <= 0) {
+        return res.status(400).send({ error: 'Contract percentage must be greater than 0' });
+      }
+      updates.contractPercentage = Math.min(100, Math.max(1, Math.round(parsed)));
     }
 
     const employee = await User.findByIdAndUpdate(req.params.id, updates, { returnDocument: 'after' });
@@ -418,6 +490,13 @@ router.get('/employees/:id/overview', auth, admin, async (req, res) => {
       type,
       count: monthlyLeaves.filter((item) => item.status === 'approved' && item.type === type).length,
     }));
+    const timeBankBalanceMinutes = await getTimeBankBalance(employee._id);
+    const timeBankDays = Math.max(0, timeBankBalanceMinutes / (settings.dailyTargetMinutes || 493));
+    employee.leaveBalances.compOff = {
+      total: Math.floor(timeBankDays * 10) / 10,
+      used: 0,
+      remaining: Math.floor(timeBankDays * 10) / 10,
+    };
 
     const workHoursSeries = [];
     for (let cursor = DateTime.fromISO(sevenDaysAgo); cursor <= now; cursor = cursor.plus({ days: 1 })) {
@@ -470,6 +549,7 @@ router.get('/employees/:id/overview', auth, admin, async (req, res) => {
         presentDays,
         totalWorkedMinutes,
         overtimeMinutes,
+        timeBankBalanceMinutes,
         pendingLeaves,
         approvedLeaves,
       },
@@ -552,6 +632,18 @@ router.patch('/attendance/:id', auth, admin, async (req, res) => {
     attendance.isEdited = true;
     attendance.modifiedBy = req.user._id;
     await attendance.save();
+
+    const settings = await ensureSettings();
+    const employee = await User.findById(attendance.userId);
+    if (employee && attendance.clockOut?.time) {
+      await syncAttendanceLedgerEntry({
+        attendance,
+        employee,
+        settings,
+        createdBy: req.user._id,
+      });
+    }
+
     res.send(attendance);
   } catch (error) {
     res.status(400).send({ error: error.message || 'Failed to update attendance' });
@@ -579,10 +671,14 @@ router.post('/attendance/manual', auth, admin, async (req, res) => {
     const hasClockOut = typeof clockOutTime === 'string' && clockOutTime.trim().length > 0;
     const hasClockIn = typeof clockInTime === 'string' && clockInTime.trim().length > 0;
     const targetClockIn = hasClockIn ? parseDateTimeInput(attendanceDate, clockInTime) : nowInBusinessZone();
-    const targetClockOut = hasClockOut ? parseDateTimeInput(attendanceDate, clockOutTime) : null;
+    let targetClockOut = hasClockOut ? parseDateTimeInput(attendanceDate, clockOutTime) : null;
 
     if (targetClockOut && targetClockOut < targetClockIn) {
-      return res.status(400).send({ error: 'Clock-out cannot be earlier than clock-in' });
+      if (getScheduleMode(settings) === 'flexible') {
+        targetClockOut = targetClockOut.plus({ days: 1 });
+      } else {
+        return res.status(400).send({ error: 'Clock-out cannot be earlier than clock-in' });
+      }
     }
 
     const normalizedLunch = Number.isFinite(Number(lunchMinutes))
@@ -629,6 +725,7 @@ router.post('/attendance/manual', auth, admin, async (req, res) => {
       attendance.breaks = [];
 
       const { workingMinutes, overtime, shortHours } = calculateManualAttendance({
+        employee,
         clockInTime: targetClockIn,
         clockOutTime: targetClockOut,
         lunchMinutes: normalizedLunch,
@@ -652,7 +749,17 @@ router.post('/attendance/manual', auth, admin, async (req, res) => {
     }
 
     await attendance.save();
+    if (targetClockOut) {
+      await syncAttendanceLedgerEntry({
+        attendance,
+        employee,
+        settings,
+        createdBy: req.user._id,
+      });
+    }
 
+    // Disabled notification for manual attendance update as per user request
+    /*
     try {
       await notifyUserById(userId, {
         title: 'Attendance updated by admin',
@@ -672,6 +779,7 @@ router.post('/attendance/manual', auth, admin, async (req, res) => {
     } catch (pushError) {
       console.error('Manual attendance notification failed:', pushError);
     }
+    */
 
     emitToUser(userId, 'attendance:updated', {
       action: 'manual-attendance',
@@ -693,6 +801,86 @@ router.post('/attendance/manual', auth, admin, async (req, res) => {
   }
 });
 
+router.get('/time-bank/:userId', auth, admin, async (req, res) => {
+  try {
+    const employee = await User.findById(req.params.userId);
+    if (!employee || employee.role !== 'employee') {
+      return res.status(404).send({ error: 'Employee not found' });
+    }
+    const balanceMinutes = await getTimeBankBalance(employee._id);
+    const entries = await getTimeBankEntries(employee._id, 100);
+    res.send({ balanceMinutes, entries, employee });
+  } catch (error) {
+    res.status(400).send({ error: error.message || 'Failed to load time bank' });
+  }
+});
+
+router.post('/time-bank/adjust', auth, admin, async (req, res) => {
+  try {
+    const { userId, effectiveDate, deltaMinutes, reason, sourceId } = req.body || {};
+    if (!userId) {
+      return res.status(400).send({ error: 'userId is required' });
+    }
+    if (!effectiveDate) {
+      return res.status(400).send({ error: 'effectiveDate is required' });
+    }
+    if (deltaMinutes === undefined || deltaMinutes === null || Number.isNaN(Number(deltaMinutes))) {
+      return res.status(400).send({ error: 'deltaMinutes is required' });
+    }
+
+    const employee = await User.findById(userId);
+    if (!employee || employee.role !== 'employee') {
+      return res.status(404).send({ error: 'Employee not found' });
+    }
+
+    const entry = await createManualAdjustmentEntry({
+      userId: employee._id,
+      effectiveDate,
+      deltaMinutes: Number(deltaMinutes),
+      note: String(reason || '').trim(),
+      createdBy: req.user._id,
+      sourceId: String(sourceId || `manual-${Date.now()}`),
+      metadata: {
+        reason: String(reason || '').trim(),
+      },
+    });
+
+    const balanceMinutes = await getTimeBankBalance(employee._id);
+    // Disabled notification for time bank adjustment as per user request
+    /*
+    await notifyUserById(employee._id, {
+      title: 'Time bank adjusted',
+      body: `Your time balance was adjusted by an administrator.${reason ? ` Reason: ${reason}` : ''}`,
+      type: 'policy',
+      refModel: 'Attendance',
+      refId: entry._id,
+      data: {
+        route: '/(employee)/attendance',
+        adjustmentId: String(entry._id),
+      },
+    }).catch((pushError) => console.error('Time bank adjustment notification failed:', pushError));
+    */
+
+    emitToUser(employee._id, 'attendance:updated', {
+      action: 'time-bank-adjustment',
+      adjustmentId: String(entry._id),
+      date: effectiveDate,
+    });
+    emitToAdmins('attendance:updated', {
+      action: 'time-bank-adjustment',
+      adjustmentId: String(entry._id),
+      userId: String(employee._id),
+      date: effectiveDate,
+    });
+    emitToAdmins('dashboard:refresh', { reason: 'time-bank-adjustment' });
+
+    res.status(201).send({ entry, balanceMinutes });
+  } catch (error) {
+    console.error('Time bank adjustment error:', error);
+    res.status(400).send({ error: error.message || 'Failed to adjust time bank' });
+  }
+});
+
 router.get('/settings', auth, admin, async (req, res) => {
   const settings = await ensureSettings();
   res.send(settings);
@@ -703,6 +891,7 @@ router.patch('/settings', auth, admin, async (req, res) => {
     const settings = await ensureSettings();
     const allowed = [
       'attendanceMode',
+      'scheduleMode',
       'qrCodeValue',
       'dailyMinutes',
       'weeklyMinutes',
@@ -720,7 +909,9 @@ router.patch('/settings', auth, admin, async (req, res) => {
       'locationLongitude',
       'locationRadius',
       'locationName',
-      'locationAddress'
+      'locationAddress',
+      'minPayoutMinutes',
+      'payoutBlockMinutes'
     ];
 
     allowed.forEach((field) => {
@@ -744,6 +935,7 @@ router.patch('/settings', auth, admin, async (req, res) => {
 router.get('/reports/summary', auth, admin, async (req, res) => {
   const totalEmployees = await User.countDocuments({ role: 'employee' });
   const pendingLeaves = await LeaveRequest.countDocuments({ status: 'pending' });
+  const pendingPayouts = await PayoutRequest.countDocuments({ status: 'pending' });
   const today = nowInBusinessZone().toISODate();
   const presentToday = await Attendance.countDocuments({ date: today });
   const settings = await ensureSettings();
@@ -752,12 +944,27 @@ router.get('/reports/summary', auth, admin, async (req, res) => {
   res.send({
     totalEmployees,
     pendingLeaves,
+    pendingPayouts,
     presentToday,
     absentToday: totalEmployees - presentToday,
     dailyMinutes: settings.dailyMinutes,
     weeklyMinutes: settings.weeklyMinutes,
     recentActivity,
   });
+});
+
+router.get('/reports/activity', auth, admin, async (req, res) => {
+  try {
+    const { limit = 50, start, end } = req.query;
+    const activity = await buildRecentActivity({
+      limit: parseInt(limit, 10),
+      start,
+      end
+    });
+    res.send(activity);
+  } catch (error) {
+    res.status(400).send({ error: error.message });
+  }
 });
 
 router.get('/reports/present-today', auth, admin, async (req, res) => {
@@ -833,6 +1040,117 @@ router.get('/reports/export', auth, admin, async (req, res) => {
   res.setHeader('Content-Type', 'text/csv');
   res.setHeader('Content-Disposition', `attachment; filename="attendance_${from}_${to}.csv"`);
   res.send(rows.join('\n'));
+});
+
+// Holiday Management
+router.get('/holidays', auth, admin, async (req, res) => {
+  const holidays = await Holiday.find().sort({ date: 1 });
+  res.send(holidays);
+});
+
+router.post('/holidays', auth, admin, async (req, res) => {
+  try {
+    const { name, date, description, isRecurring } = req.body;
+    if (!name || !date) {
+      return res.status(400).send({ error: 'Name and date are required' });
+    }
+    const holiday = new Holiday({ name, date, description, isRecurring });
+    await holiday.save();
+
+    // Trigger credit for this holiday for all employees
+    const settings = await ensureSettings();
+    const employees = await User.find({ role: 'employee', isActive: true });
+    
+    await Promise.all(employees.map(employee => 
+      syncHolidayLedgerEntry({
+        holiday,
+        employee,
+        settings,
+        createdBy: req.user._id
+      })
+    ));
+
+    res.status(201).send(holiday);
+  } catch (error) {
+    if (error.code === 11000) {
+      return res.status(400).send({ error: 'A holiday already exists for this date' });
+    }
+    res.status(400).send({ error: error.message });
+  }
+});
+
+router.delete('/holidays/:id', auth, admin, async (req, res) => {
+  try {
+    const holiday = await Holiday.findById(req.params.id);
+    if (!holiday) return res.status(404).send({ error: 'Holiday not found' });
+    
+    // Remove associated ledger entries
+    await TimeBankEntry.deleteMany({ sourceType: 'holiday', sourceId: String(holiday._id) });
+    await Holiday.findByIdAndDelete(req.params.id);
+    
+    res.send({ ok: true });
+  } catch (error) {
+    res.status(400).send({ error: error.message });
+  }
+});
+
+// Payout Management
+router.get('/payouts', auth, admin, async (req, res) => {
+  try {
+    const payouts = await PayoutRequest.find({})
+      .populate('userId', 'name employeeId')
+      .sort({ createdAt: -1 });
+    res.send(payouts);
+  } catch (error) {
+    res.status(500).send(error);
+  }
+});
+
+router.patch('/payouts/:id', auth, admin, async (req, res) => {
+  try {
+    const { status, adminComment } = req.body;
+    const payout = await PayoutRequest.findById(req.params.id);
+    if (!payout) return res.status(404).send({ error: 'Payout request not found' });
+
+    payout.status = status;
+    payout.adminComment = adminComment;
+    payout.processedAt = new Date();
+    payout.processedBy = req.user._id;
+
+    await payout.save();
+
+    // Sync with Ledger if approved
+    const employee = await User.findById(payout.userId);
+    if (employee) {
+      await syncPayoutLedgerEntry({
+        payoutRequest: payout,
+        employee,
+        createdBy: req.user._id,
+      });
+    }
+
+    // Notify User
+    try {
+      const isApproved = status === 'approved';
+      await notifyUserById(payout.userId, {
+        title: isApproved ? 'Payout Approved' : 'Payout Rejected',
+        body: isApproved 
+          ? `Your payout of ${Math.round(payout.amountMinutes / 60 * 10) / 10} hours has been approved.` 
+          : `Your payout request was rejected. Reason: ${adminComment || 'No reason provided'}`,
+        type: 'payout',
+        refModel: 'PayoutRequest',
+        refId: payout._id,
+      });
+    } catch (err) {
+      console.error('User payout notification failed:', err);
+    }
+
+    emitToUser(payout.userId, 'payout:updated', { action: 'decision', payoutId: String(payout._id), status });
+
+    res.send(payout);
+  } catch (error) {
+    res.status(400).send(error);
+  }
 });
 
 module.exports = router;

@@ -7,6 +7,10 @@ const Attendance = require('../models/Attendance');
 const LeaveRequest = require('../models/LeaveRequest');
 const Setting = require('../models/Setting');
 const { removePushToken, savePushToken } = require('../utils/pushNotifications');
+const {
+  getEmployeeDailyTargetMinutes,
+  getScheduleMode,
+} = require('../utils/attendancePolicy');
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
@@ -45,7 +49,10 @@ const generateForUser = async (user) => {
   const today = DateTime.now().toISODate();
   const todayStart = DateTime.now().startOf('day').toJSDate();
   const settings = await ensureSettings();
-  const dailyTarget = settings.dailyMinutes ?? 493; // 8h 13m default
+  const scheduleMode = getScheduleMode(settings);
+  const dailyTarget = scheduleMode === 'flexible'
+    ? getEmployeeDailyTargetMinutes(user, settings)
+    : (settings.dailyMinutes ?? 493); // 8h 13m default
   const clockInWindowStart = settings.clockInWindowStart ?? 360; // 6:00 AM in minutes
 
   // ── 1. Late clock-in alert ───────────────────────────────────────────────
@@ -54,7 +61,7 @@ const generateForUser = async (user) => {
     const clockInMinute =
       DateTime.fromJSDate(todayAttendance.clockIn.time).hour * 60 +
       DateTime.fromJSDate(todayAttendance.clockIn.time).minute;
-    const lateBy = clockInMinute - clockInWindowStart;
+    const lateBy = scheduleMode === 'shift' ? clockInMinute - clockInWindowStart : 0;
     if (lateBy > 5) {
       // Only create once per attendance record
       const exists = await Notification.findOne({
@@ -155,7 +162,7 @@ const generateForUser = async (user) => {
   // ── 5. Daily attendance policy reminder (employee, if no clock-in yet) ────
   if (user.role === 'employee' && !todayAttendance) {
     const nowMinute = DateTime.now().hour * 60 + DateTime.now().minute;
-    if (nowMinute >= clockInWindowStart) {
+    if (scheduleMode === 'shift' && nowMinute >= clockInWindowStart) {
       const exists = await Notification.findOne({
         userId: user._id,
         type: 'policy',
@@ -232,16 +239,13 @@ router.delete('/push-token', auth, async (req, res) => {
 
 router.delete('/clear-old', auth, async (req, res) => {
   try {
-    const now = DateTime.now();
-    const keepAfter = now.minus({ days: 7 }).toJSDate();
     const result = await Notification.deleteMany({
       userId: req.user._id,
       read: true,
-      createdAt: { $lt: keepAfter },
     });
     res.send({ ok: true, deletedCount: result.deletedCount || 0 });
   } catch (err) {
-    res.status(500).send({ error: 'Failed to clear old notifications' });
+    res.status(500).send({ error: 'Failed to clear notifications' });
   }
 });
 

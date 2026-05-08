@@ -7,6 +7,7 @@ const SettingSchema = new mongoose.Schema({
   sickLeaveTotal: { type: Number, default: 6 },
   compOffTotal: { type: Number, default: 0 },
   attendanceMode: { type: String, enum: ['selfie', 'qr'], default: 'selfie' },
+  scheduleMode: { type: String, enum: ['shift', 'flexible'], default: 'shift' },
   qrCodeValue: { type: String, default: '' },
   clockInWindowStart: { type: Number, default: 6 * 60 },
   clockInWindowEnd: { type: Number, default: 10 * 60 },
@@ -20,6 +21,8 @@ const SettingSchema = new mongoose.Schema({
   locationRadius: { type: Number, default: 500 }, // meters
   locationName: String,
   locationAddress: String,
+  minPayoutMinutes: { type: Number, default: 480 }, // Default 8 hours
+  payoutBlockMinutes: { type: Number, default: 240 }, // Default 4 hours blocks
 }, { timestamps: true });
 
 module.exports = mongoose.model('Setting', SettingSchema);

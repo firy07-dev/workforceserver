@@ -6,6 +6,16 @@ const Setting = require('../models/Setting');
 const { DateTime } = require('luxon');
 const { notifyAdmins } = require('../utils/pushNotifications');
 const { emitToAdmins, emitToUser } = require('../utils/realtime');
+const {
+  calculateAttendanceTotals,
+  getScheduleMode,
+  getEmployeeDailyTargetMinutes,
+} = require('../utils/attendancePolicy');
+const {
+  syncAttendanceLedgerEntry,
+  getTimeBankBalance,
+  getTimeBankEntries,
+} = require('../utils/timeBankLedger');
 
 const BUSINESS_TIMEZONE = process.env.APP_TIMEZONE || 'Asia/Kolkata';
 const nowInBusinessZone = () => DateTime.now().setZone(BUSINESS_TIMEZONE);
@@ -36,8 +46,6 @@ const isWithinWindow = (currentMinutes, startMinutes, endMinutes) => {
   }
   return currentMinutes >= startMinutes || currentMinutes <= endMinutes;
 };
-const withMinutesOnDate = (baseDateTime, totalMinutes) => baseDateTime.startOf('day').plus({ minutes: totalMinutes });
-
 const getDistanceMeters = (lat1, lon1, lat2, lon2) => {
   const toRad = (value) => (value * Math.PI) / 180;
   const R = 6371e3; // meters
@@ -103,17 +111,80 @@ const syncPrimaryDevice = async ({ user, deviceId, deviceName }) => {
   return { mismatch, primaryDevice: user.primaryDevice };
 };
 
+const findOpenAttendanceRecord = async (userId, now) => {
+  const today = now.toFormat('yyyy-MM-dd');
+  const recentCutoff = now.minus({ days: 1 }).toJSDate();
+
+  const todayRecord = await Attendance.findOne({
+    userId,
+    date: today,
+    'clockOut.time': { $exists: false },
+  });
+  if (todayRecord) return todayRecord;
+
+  return Attendance.findOne({
+    userId,
+    'clockOut.time': { $exists: false },
+    'clockIn.time': { $gte: recentCutoff },
+  }).sort({ 'clockIn.time': -1 });
+};
+
 // Get current status
 router.get('/status', auth, async (req, res) => {
   const today = nowInBusinessZone().toFormat('yyyy-MM-dd');
-  const record = await Attendance.findOne({ userId: req.user._id, date: today });
-  res.send(record || { status: 'none' });
+  const record = await Attendance.findOne({
+    userId: req.user._id,
+    date: today,
+  }) || await Attendance.findOne({
+    userId: req.user._id,
+    'clockOut.time': { $exists: false },
+    'clockIn.time': { $gte: nowInBusinessZone().minus({ days: 1 }).toJSDate() },
+  }).sort({ 'clockIn.time': -1 });
+  const timeBankBalanceMinutes = await getTimeBankBalance(req.user._id);
+  const settings = await ensureSettings();
+
+  // Calculate Health Score (Monthly performance)
+  const now = nowInBusinessZone();
+  const monthStart = now.startOf('month').toISODate();
+  const monthlyAttendance = await Attendance.find({
+    userId: req.user._id,
+    date: { $gte: monthStart, $lte: now.toISODate() },
+  });
+
+  const totalWorkedMinutes = monthlyAttendance.reduce((sum, item) => sum + (item.totalHours || 0), 0);
+  
+  // Calculate monthly target so far
+  let monthlyTargetSoFar = 0;
+  for (let d = now.startOf('month'); d <= now; d = d.plus({ days: 1 })) {
+    monthlyTargetSoFar += getEmployeeDailyTargetMinutes(req.user, settings, d);
+  }
+
+  const healthScore = monthlyTargetSoFar > 0 
+    ? Math.min(100, Math.round((totalWorkedMinutes / monthlyTargetSoFar) * 100))
+    : 100;
+
+  res.send({
+    ...(record?.toObject?.() || record || { status: 'none' }),
+    timeBankBalanceMinutes,
+    healthScore,
+    monthlyWorkedMinutes: totalWorkedMinutes,
+  });
+});
+
+router.get('/time-bank', auth, async (req, res) => {
+  const balanceMinutes = await getTimeBankBalance(req.user._id);
+  const entries = await getTimeBankEntries(req.user._id, 100);
+  res.send({
+    balanceMinutes,
+    entries,
+  });
 });
 
 router.get('/config', auth, async (req, res) => {
   const settings = await ensureSettings();
   res.send({
     attendanceMode: settings.attendanceMode,
+    scheduleMode: settings.scheduleMode,
     dailyMinutes: settings.dailyMinutes,
     weeklyMinutes: settings.weeklyMinutes,
     clockInWindowStart: settings.clockInWindowStart,
@@ -131,9 +202,10 @@ router.post('/clock-in', auth, async (req, res) => {
   try {
     const now = nowInBusinessZone();
     const settings = await ensureSettings();
+    const scheduleMode = getScheduleMode(settings);
 
     const currentMinutes = toMinutes(now);
-    if (currentMinutes < settings.clockInWindowStart) {
+    if (scheduleMode === 'shift' && currentMinutes < settings.clockInWindowStart) {
       return res.status(400).send({
         error: `Clock-in opens at ${toClockLabel(settings.clockInWindowStart)}`,
       });
@@ -219,7 +291,7 @@ router.post('/clock-in', auth, async (req, res) => {
       }
     }
 
-    const lateByMinutes = Math.max(0, currentMinutes - settings.clockInWindowEnd);
+    const lateByMinutes = scheduleMode === 'shift' ? Math.max(0, currentMinutes - settings.clockInWindowEnd) : 0;
     if (lateByMinutes > 0) {
       try {
         await notifyAdmins({
@@ -264,14 +336,15 @@ router.post('/clock-out', auth, async (req, res) => {
   try {
     const now = nowInBusinessZone();
     const settings = await ensureSettings();
+    const scheduleMode = getScheduleMode(settings);
 
     const today = now.toFormat('yyyy-MM-dd');
-    const record = await Attendance.findOne({ userId: req.user._id, date: today });
+    const record = await findOpenAttendanceRecord(req.user._id, now);
     if (!record) return res.status(400).send({ error: 'No clock-in record found for today' });
     if (record.clockOut.time) return res.status(400).send({ error: 'Already clocked out' });
 
     const currentMinutes = toMinutes(now);
-    if (currentMinutes < settings.clockOutEarliest && !record.emergencyLeaveApproved) {
+    if (scheduleMode === 'shift' && currentMinutes < settings.clockOutEarliest && !record.emergencyLeaveApproved) {
       return res.status(400).send({ error: 'Clock-out is allowed only after the configured end of day' });
     }
 
@@ -310,33 +383,18 @@ router.post('/clock-out', auth, async (req, res) => {
       location: req.body.location
     };
 
-    // Calculate total hours from the effective shift start; early arrival before shift start does not count.
     const actualClockInTime = DateTime.fromJSDate(record.clockIn.time).setZone(BUSINESS_TIMEZONE);
-    const shiftStartTime = withMinutesOnDate(now, settings.clockInWindowStart || 0);
-    const effectiveClockInTime = actualClockInTime < shiftStartTime ? shiftStartTime : actualClockInTime;
     const clockOutTime = now;
-    const duration = clockOutTime.diff(effectiveClockInTime, 'minutes').minutes;
-
-    // Subtract breaks; default to the configured lunch minimum (30 min) when no break is recorded
-    let actualBreakMinutes = 0;
-    record.breaks.forEach(b => {
-      if (b.start && b.end) {
-        actualBreakMinutes += DateTime.fromJSDate(b.end).diff(DateTime.fromJSDate(b.start), 'minutes').minutes;
-      }
+    const totals = calculateAttendanceTotals({
+      employee: req.user,
+      settings,
+      clockInTime: actualClockInTime,
+      clockOutTime,
+      breaks: record.breaks || [],
     });
-    const defaultLunchDeduction = settings.lunchMinimumMinutes || 30;
-    const breakMinutes = actualBreakMinutes > 0 ? actualBreakMinutes : defaultLunchDeduction;
-    
-    const workingMinutes = Math.max(0, duration - breakMinutes);
-    record.totalHours = workingMinutes;
-
-    const standardMinutes = settings.dailyMinutes || 493;
-    const overtimeGraceMinutes = typeof settings.overtimeGraceMinutes === 'number' ? settings.overtimeGraceMinutes : 60;
-    const overtimeThresholdTime = withMinutesOnDate(now, (settings.clockOutEarliest || 0) + overtimeGraceMinutes);
-    record.overtime = clockOutTime >= overtimeThresholdTime
-      ? Math.max(0, Math.round(clockOutTime.diff(withMinutesOnDate(now, settings.clockOutEarliest || 0), 'minutes').minutes))
-      : 0;
-    record.shortHours = Math.max(0, standardMinutes - workingMinutes);
+    record.totalHours = totals.workingMinutes;
+    record.overtime = totals.overtime;
+    record.shortHours = totals.shortHours;
     if (typeof req.body.shortHoursReason === 'string') {
       record.shortHoursReason = req.body.shortHoursReason.trim();
     }
@@ -364,13 +422,13 @@ router.post('/clock-out', auth, async (req, res) => {
     emitToUser(req.user._id, 'attendance:updated', {
       action: 'clock-out',
       attendanceId: String(record._id),
-      date: today,
+      date: record.date || today,
     });
     emitToAdmins('attendance:updated', {
       action: 'clock-out',
       attendanceId: String(record._id),
       userId: String(req.user._id),
-      date: today,
+      date: record.date || today,
     });
     emitToAdmins('dashboard:refresh', { reason: 'clock-out' });
     res.send(record);
@@ -391,16 +449,20 @@ router.post('/break/start', auth, async (req, res) => {
   try {
     const now = nowInBusinessZone();
     const settings = await ensureSettings();
+    const scheduleMode = getScheduleMode(settings);
     const today = now.toFormat('yyyy-MM-dd');
     const currentMinutes = toMinutes(now);
 
-    if (currentMinutes < settings.lunchBreakStart || currentMinutes > settings.lunchBreakEnd) {
+    if (scheduleMode === 'shift' && (currentMinutes < settings.lunchBreakStart || currentMinutes > settings.lunchBreakEnd)) {
       return res.status(400).send({ error: 'Break can only start during the configured lunch window' });
     }
 
-    const record = await Attendance.findOne({ userId: req.user._id, date: today });
+    const record = await findOpenAttendanceRecord(req.user._id, now);
     if (!record) return res.status(400).send({ error: 'No attendance record found for today' });
     if (!record.clockIn.time) return res.status(400).send({ error: 'Clock in before taking a break' });
+    if (record.breaks.some(b => b.start)) {
+      return res.status(400).send({ error: 'Only one break is allowed per day' });
+    }
     if (record.breaks.some(b => b.start && !b.end)) {
       return res.status(400).send({ error: 'A break is already in progress' });
     }
@@ -418,13 +480,13 @@ router.post('/break/start', auth, async (req, res) => {
     emitToUser(req.user._id, 'attendance:updated', {
       action: 'break-start',
       attendanceId: String(record._id),
-      date: today,
+      date: record.date || today,
     });
     emitToAdmins('attendance:updated', {
       action: 'break-start',
       attendanceId: String(record._id),
       userId: String(req.user._id),
-      date: today,
+      date: record.date || today,
     });
     res.send(record);
   } catch (error) {
@@ -439,7 +501,7 @@ router.post('/break/end', auth, async (req, res) => {
     const now = nowInBusinessZone();
     const settings = await ensureSettings();
     const today = now.toFormat('yyyy-MM-dd');
-    const record = await Attendance.findOne({ userId: req.user._id, date: today });
+    const record = await findOpenAttendanceRecord(req.user._id, now);
     if (!record) return res.status(400).send({ error: 'No attendance record found for today' });
 
     const activeBreak = record.breaks.find(b => b.start && !b.end);
@@ -464,13 +526,13 @@ router.post('/break/end', auth, async (req, res) => {
     emitToUser(req.user._id, 'attendance:updated', {
       action: 'break-end',
       attendanceId: String(record._id),
-      date: today,
+      date: record.date || today,
     });
     emitToAdmins('attendance:updated', {
       action: 'break-end',
       attendanceId: String(record._id),
       userId: String(req.user._id),
-      date: today,
+      date: record.date || today,
     });
     res.send(record);
   } catch (error) {

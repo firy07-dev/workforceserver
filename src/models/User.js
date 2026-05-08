@@ -23,6 +23,7 @@ const UserSchema = new mongoose.Schema({
   gender: { type: String },
   department: String,
   designation: String,
+  contractPercentage: { type: Number, default: 100 },
   joinDate: { type: Date, default: Date.now },
   profilePhoto: String,
   leaveBalances: {
