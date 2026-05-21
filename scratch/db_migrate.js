@@ -1,10 +1,16 @@
 const { MongoClient } = require('mongodb');
+const dotenv = require('dotenv');
 
-// Source and Destination URLs
-const SOURCE_URL = "mongodb+srv://lms_user:LKQMKoZWnnYRb4IU@cluster0.ffzv4sh.mongodb.net/lms_db";
-const DEST_URL = "mongodb+srv://firy07_db_user:9qIYAeNL2zlPnkMm@cluster0.2jgld7l.mongodb.net/lms_db";
+dotenv.config();
+
+const SOURCE_URL = process.env.SOURCE_MONGODB_URL;
+const DEST_URL = process.env.DEST_MONGODB_URL;
 
 async function migrate() {
+  if (!SOURCE_URL || !DEST_URL) {
+    throw new Error('SOURCE_MONGODB_URL and DEST_MONGODB_URL are required');
+  }
+
   const sourceClient = new MongoClient(SOURCE_URL);
   const destClient = new MongoClient(DEST_URL);
 

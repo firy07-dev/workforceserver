@@ -1,4 +1,5 @@
 const mongoose = require('mongoose');
+const dotenv = require('dotenv');
 
 // Models
 const User = require('../src/models/User');
@@ -8,10 +9,16 @@ const Notification = require('../src/models/Notification');
 const PayoutRequest = require('../src/models/PayoutRequest');
 const TimeBankEntry = require('../src/models/TimeBankEntry');
 
-const MONGODB_URL = "mongodb+srv://firy07_db_user:9qIYAeNL2zlPnkMm@cluster0.2jgld7l.mongodb.net/lms_db";
+dotenv.config();
+
+const MONGODB_URL = process.env.MONGODB_URL;
 
 async function cleanup() {
   try {
+    if (!MONGODB_URL) {
+      throw new Error('MONGODB_URL is required');
+    }
+
     await mongoose.connect(MONGODB_URL);
     console.log('Connected to MongoDB.');
 
