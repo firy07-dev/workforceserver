@@ -14,6 +14,7 @@ const { emitToAdmins, emitToUser } = require('../utils/realtime');
 const {
   calculateAttendanceTotals,
   getScheduleMode,
+  getEmployeeDailyTargetMinutes,
 } = require('../utils/attendancePolicy');
 const {
   syncAttendanceLedgerEntry,
@@ -24,31 +25,44 @@ const {
   syncLeaveLedgerEntry,
   syncPayoutLedgerEntry,
 } = require('../utils/timeBankLedger');
+const { settleDailyAbsences } = require('../jobs/timeBank');
+
+router.post('/settle-absences', auth, admin, async (req, res) => {
+  try {
+    const report = await settleDailyAbsences();
+    emitToAdmins('dashboard:refresh', { reason: 'settle-absences' });
+    res.status(200).send({
+      message: 'Absence settlement job finished.',
+      report,
+      version: 2,
+    });
+  } catch (error) {
+    console.error('Failed to start settle-absences job:', error);
+    res.status(500).send({ error: 'Failed to start the job.' });
+  }
+});
 
 const BUSINESS_TIMEZONE = process.env.APP_TIMEZONE || 'Asia/Kolkata';
 const nowInBusinessZone = () => DateTime.now().setZone(BUSINESS_TIMEZONE);
 const parseDateTimeInput = (dateValue, timeValue) => {
-  const dateStr = String(dateValue || nowInBusinessZone().toISODate() || '').trim();
+  const dateStr = String(dateValue || '').trim();
   const timeStr = String(timeValue || '').trim();
 
-  if (!dateStr) {
-    throw new Error('date is required');
-  }
-  if (!timeStr) {
-    throw new Error('time is required');
-  }
+  if (!dateStr) throw new Error('date is required');
+  if (!timeStr) throw new Error('time is required');
 
-  const normalizedTime = /^\d{2}:\d{2}(:\d{2})?$/.test(timeStr) ? timeStr : null;
-  if (!normalizedTime) {
-    throw new Error('time must be in HH:mm format');
-  }
-
-  const dt = DateTime.fromISO(`${dateStr}T${normalizedTime.length === 5 ? `${normalizedTime}:00` : normalizedTime}`, {
-    zone: BUSINESS_TIMEZONE,
-  });
+  // Allow HH:mm, HH:mm:ss, or full ISO strings with offsets
+  const dt = DateTime.fromISO(`${dateStr}T${timeStr}`, { setZone: true });
+  
   if (!dt.isValid) {
-    throw new Error('Invalid date or time');
+    // Fallback: try forcing the BUSINESS_TIMEZONE if no offset was provided
+    const fallbackDt = DateTime.fromISO(`${dateStr}T${timeStr}`, { zone: BUSINESS_TIMEZONE });
+    if (!fallbackDt.isValid) {
+      throw new Error('Invalid date or time format');
+    }
+    return fallbackDt;
   }
+  
   return dt;
 };
 
@@ -70,6 +84,90 @@ const calculateManualAttendance = ({ employee, clockInTime, clockOutTime, lunchM
   });
 
   return { breakMinutes: normalizedLunch, workingMinutes: totals.workingMinutes, overtime: totals.overtime, shortHours: totals.shortHours };
+};
+
+const markEmployeeAbsent = async ({ userId, date, adminId }) => {
+  if (!userId) {
+    const error = new Error('userId is required');
+    error.statusCode = 400;
+    throw error;
+  }
+
+  if (!date) {
+    const error = new Error('Date is required');
+    error.statusCode = 400;
+    throw error;
+  }
+
+  const target = DateTime.fromISO(String(date).trim());
+  if (!target.isValid) {
+    const error = new Error('Invalid date format');
+    error.statusCode = 400;
+    throw error;
+  }
+
+  const employee = await User.findById(userId);
+  if (!employee || employee.role !== 'employee') {
+    const error = new Error('Employee not found');
+    error.statusCode = 404;
+    throw error;
+  }
+
+  const targetDate = target.toISODate();
+
+  const existingAttendance = await Attendance.findOne({ userId: employee._id, date: targetDate });
+  if (existingAttendance) {
+    const error = new Error('An attendance record for this date already exists.');
+    error.statusCode = 400;
+    throw error;
+  }
+
+  const existingLeave = await LeaveRequest.findOne({
+    userId: employee._id,
+    status: 'approved',
+    startDate: { $lte: targetDate },
+    endDate: { $gte: targetDate },
+  });
+  if (existingLeave) {
+    const error = new Error('An approved leave for this date already exists.');
+    error.statusCode = 400;
+    throw error;
+  }
+
+  const absentRecord = new Attendance({
+    userId: employee._id,
+    date: targetDate,
+    status: 'absent',
+    verificationMethod: 'manual',
+    verificationStatus: 'verified',
+    totalHours: 0,
+    overtime: 0,
+    shortHours: 0,
+    manualEntry: true,
+    manualReason: 'Manually marked as absent by admin.',
+    manualCreatedBy: adminId,
+    manualCreatedAt: nowInBusinessZone().toJSDate(),
+    isEdited: true,
+    modifiedBy: adminId,
+  });
+
+  await absentRecord.save();
+
+  emitToUser(employee._id, 'attendance:updated', {
+    action: 'manual-absence',
+    attendanceId: String(absentRecord._id),
+    date: targetDate,
+  });
+  emitToAdmins('attendance:updated', {
+    action: 'manual-absence',
+    attendanceId: String(absentRecord._id),
+    userId: String(employee._id),
+    date: targetDate,
+    record: absentRecord,
+  });
+  emitToAdmins('dashboard:refresh', { reason: 'manual-absence' });
+
+  return absentRecord;
 };
 
 const buildRecentActivity = async (options = {}) => {
@@ -447,6 +545,22 @@ router.delete('/employees/:id', auth, admin, async (req, res) => {
   }
 });
 
+router.post('/employees/:id/mark-absent', auth, admin, async (req, res) => {
+  try {
+    const absentRecord = await markEmployeeAbsent({
+      userId: req.params.id,
+      date: req.body?.date,
+      adminId: req.user._id,
+    });
+
+    res.status(201).send(absentRecord);
+  } catch (error) {
+    console.error('Mark Absent Error:', error);
+    res.status(error.statusCode || 500).send({ error: error.message || 'Failed to mark employee as absent.' });
+  }
+});
+
+
 router.get('/employees/:id/overview', auth, admin, async (req, res) => {
   try {
     const employee = await User.findById(req.params.id).select('-password');
@@ -476,7 +590,7 @@ router.get('/employees/:id/overview', auth, admin, async (req, res) => {
         date: { $gte: sevenDaysAgo, $lte: now.toISODate() },
       }).sort({ date: 1 }),
       LeaveRequest.find({ userId: employee._id }).sort({ updatedAt: -1 }).limit(5),
-      Attendance.find({ userId: employee._id }).sort({ date: 1 }),
+      Attendance.find({ userId: employee._id }).sort({ date: 1 }).lean(),
       LeaveRequest.find({ userId: employee._id, status: 'approved' }).sort({ startDate: 1 }),
     ]);
 
@@ -543,6 +657,26 @@ router.get('/employees/:id/overview', auth, admin, async (req, res) => {
       .sort((a, b) => new Date(b.timestamp).getTime() - new Date(a.timestamp).getTime())
       .slice(0, 8);
 
+    const processedHistory = fullAttendanceHistory.map(rec => {
+      const autoLunchMinutes = rec.breaks?.reduce((total, br) => {
+        if (br.start && br.end) {
+          const start = DateTime.fromJSDate(br.start);
+          const end = DateTime.fromJSDate(br.end);
+          const diff = end.diff(start, 'minutes').minutes;
+          return total + diff;
+        }
+        return total;
+      }, 0) || 0;
+
+      const shortfall = Math.max(0, getEmployeeDailyTargetMinutes(employee, settings, rec.date) - (rec.totalHours || 0));
+
+      return {
+        ...rec,
+        autoLunchMinutes: Math.round(autoLunchMinutes),
+        shortfall: Math.round(shortfall),
+      };
+    });
+
     res.send({
       employee,
       stats: {
@@ -556,7 +690,7 @@ router.get('/employees/:id/overview', auth, admin, async (req, res) => {
       workHoursSeries,
       leaveBreakdown,
       recentActivity,
-      attendanceHistory: fullAttendanceHistory,
+      attendanceHistory: processedHistory,
       approvedLeaves: approvedLeaveRecords,
     });
   } catch (error) {
@@ -647,6 +781,21 @@ router.patch('/attendance/:id', auth, admin, async (req, res) => {
     res.send(attendance);
   } catch (error) {
     res.status(400).send({ error: error.message || 'Failed to update attendance' });
+  }
+});
+
+router.post('/attendance/mark-absent', auth, admin, async (req, res) => {
+  try {
+    const absentRecord = await markEmployeeAbsent({
+      userId: req.body?.userId,
+      date: req.body?.date,
+      adminId: req.user._id,
+    });
+
+    res.status(201).send(absentRecord);
+  } catch (error) {
+    console.error('Manual mark absent error:', error);
+    res.status(error.statusCode || 500).send({ error: error.message || 'Failed to mark employee as absent.' });
   }
 });
 

@@ -1,9 +1,9 @@
 require('dotenv').config();
 const mongoose = require('mongoose');
-const User = require('./src/models/User');
-const Attendance = require('./src/models/Attendance');
-const LeaveRequest = require('./src/models/LeaveRequest');
-const Notification = require('./src/models/Notification');
+const User = require('../src/models/User');
+const Attendance = require('../src/models/Attendance');
+const LeaveRequest = require('../src/models/LeaveRequest');
+const Notification = require('../src/models/Notification');
 
 async function cleanEmployees() {
   const MONGODB_URL = process.env.MONGODB_URL;

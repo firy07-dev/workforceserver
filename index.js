@@ -4,6 +4,8 @@ const mongoose = require('mongoose');
 const cors = require('cors');
 const path = require('path');
 const http = require('http');
+const cron = require('node-cron');
+const { settleDailyAbsences } = require('./src/jobs/timeBank');
 
 const authRoutes = require('./src/routes/auth');
 const attendanceRoutes = require('./src/routes/attendance');
@@ -59,6 +61,21 @@ async function startServer() {
 
     server.listen(PORT, () => {
       console.log(`Server running on port ${PORT}`);
+      // Schedule the daily absence settlement job
+      cron.schedule('0 3 * * *', () => {
+        console.log('Running the daily absence settlement job...');
+        settleDailyAbsences()
+          .then(report => {
+            console.log('Absence settlement job finished successfully.');
+            console.log(report);
+          })
+          .catch(error => {
+            console.error('Error running the absence settlement job:', error);
+          });
+      }, {
+        scheduled: true,
+        timezone: process.env.TIMEZONE || "Asia/Kolkata"
+      });
     });
   } catch (error) {
     console.error('MongoDB connection error:', error);

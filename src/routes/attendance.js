@@ -401,6 +401,13 @@ router.post('/clock-out', auth, async (req, res) => {
 
     await record.save();
 
+    await syncAttendanceLedgerEntry({
+      attendance: record,
+      employee: req.user,
+      settings,
+      createdBy: req.user._id,
+    });
+
     if (record.shortHours > 0 && !record.emergencyLeaveApproved) {
       try {
         await notifyAdmins({
@@ -440,8 +447,26 @@ router.post('/clock-out', auth, async (req, res) => {
 
 // History
 router.get('/history', auth, async (req, res) => {
-  const history = await Attendance.find({ userId: req.user._id }).sort({ date: -1 });
-  res.send(history);
+  const history = await Attendance.find({ userId: req.user._id }).sort({ date: -1 }).lean();
+  
+  const processedHistory = history.map(rec => {
+    const autoLunchMinutes = rec.breaks?.reduce((total, br) => {
+      if (br.start && br.end) {
+        const start = DateTime.fromJSDate(br.start);
+        const end = DateTime.fromJSDate(br.end);
+        const diff = end.diff(start, 'minutes').minutes;
+        return total + diff;
+      }
+      return total;
+    }, 0) || 0;
+
+    return {
+      ...rec,
+      autoLunchMinutes: Math.round(autoLunchMinutes),
+    };
+  });
+
+  res.send(processedHistory);
 });
 
 // Start lunch break
@@ -509,10 +534,15 @@ router.post('/break/end', auth, async (req, res) => {
       return res.status(400).send({ error: 'No active break to stop' });
     }
 
-    const breakStart = DateTime.fromJSDate(activeBreak.start);
+    const breakStart = DateTime.fromJSDate(activeBreak.start).setZone(BUSINESS_TIMEZONE);
     const duration = now.diff(breakStart, 'minutes').minutes;
     if (duration < settings.lunchMinimumMinutes) {
-      return res.status(400).send({ error: 'Break must be at least the minimum configured duration' });
+      const remainingMinutes = Math.ceil(settings.lunchMinimumMinutes - duration);
+      return res.status(400).send({
+        error: `Break must be at least ${settings.lunchMinimumMinutes} minutes. Please wait ${remainingMinutes} more minute(s).`,
+        code: 'BREAK_TOO_SHORT',
+        remainingMinutes,
+      });
     }
 
     if (!req.body.location?.latitude || !req.body.location?.longitude) {

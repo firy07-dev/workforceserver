@@ -1,5 +1,6 @@
 const TimeBankEntry = require('../models/TimeBankEntry');
 const { getEmployeeDailyTargetMinutes, getScheduleMode } = require('./attendancePolicy');
+const { DateTime } = require('luxon');
 
 const toSafeDelta = (value) => Math.round(Number(value) || 0);
 
@@ -40,7 +41,7 @@ const syncAttendanceLedgerEntry = async ({
         shortHoursMinutes: Math.max(0, -deltaMinutes),
       },
     },
-    { upsert: true, new: true, setDefaultsOnInsert: true }
+    { upsert: true, returnDocument: 'after', setDefaultsOnInsert: true }
   );
 };
 
@@ -71,7 +72,7 @@ const createManualAdjustmentEntry = async ({
       createdBy,
       metadata,
     },
-    { upsert: true, new: true, setDefaultsOnInsert: true }
+    { upsert: true, returnDocument: 'after', setDefaultsOnInsert: true }
   );
 };
 
@@ -106,7 +107,7 @@ const syncHolidayLedgerEntry = async ({
         targetMinutes,
       },
     },
-    { upsert: true, new: true, setDefaultsOnInsert: true }
+    { upsert: true, returnDocument: 'after', setDefaultsOnInsert: true }
   );
 };
 
@@ -171,7 +172,7 @@ const syncLeaveLedgerEntry = async ({
         totalDebitMinutes: totalDebit,
       },
     },
-    { upsert: true, new: true, setDefaultsOnInsert: true }
+    { upsert: true, returnDocument: 'after', setDefaultsOnInsert: true }
   );
 };
 
@@ -211,6 +212,33 @@ const syncPayoutLedgerEntry = async ({
         amountMinutes: payoutRequest.amountMinutes,
       },
     },
+    { upsert: true, returnDocument: 'after', setDefaultsOnInsert: true }
+  );
+};
+
+const syncTimeBankForAbsence = async ({ employee, date, targetMinutes }) => {
+  if (!employee || !date || !targetMinutes) return null;
+
+  const deltaMinutes = -Math.abs(targetMinutes);
+  const sourceId = `absence-${date}`;
+  return TimeBankEntry.findOneAndUpdate(
+    {
+      userId: employee._id,
+      sourceType: 'absence',
+      sourceId: sourceId,
+    },
+    {
+      userId: employee._id,
+      effectiveDate: date,
+      sourceType: 'absence',
+      sourceId: sourceId,
+      entryType: 'debit',
+      deltaMinutes,
+      note: `Unexcused absence on ${date}`,
+      metadata: {
+        targetMinutes,
+      },
+    },
     { upsert: true, new: true, setDefaultsOnInsert: true }
   );
 };
@@ -223,4 +251,5 @@ module.exports = {
   syncHolidayLedgerEntry,
   syncLeaveLedgerEntry,
   syncPayoutLedgerEntry,
+  syncTimeBankForAbsence,
 };

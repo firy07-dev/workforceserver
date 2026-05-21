@@ -19,7 +19,11 @@ const getBaseWeeklyMinutes = (settings = {}) => toSafeMinutes(settings.weeklyMin
 
 const getEmployeeDailyTargetMinutes = (employee = {}, settings = {}, date = null) => {
   if (date) {
-    const dt = typeof date === 'string' ? DateTime.fromISO(date) : DateTime.fromJSDate(date);
+    const timezone = process.env.APP_TIMEZONE || 'Asia/Kolkata';
+    const dt = typeof date === 'string' 
+      ? DateTime.fromISO(date, { zone: timezone }) 
+      : DateTime.fromJSDate(date).setZone(timezone);
+      
     // 6 = Saturday, 7 = Sunday
     if (dt.weekday === 6 || dt.weekday === 7) {
       return 0;

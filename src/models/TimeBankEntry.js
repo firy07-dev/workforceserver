@@ -5,7 +5,7 @@ const TimeBankEntrySchema = new mongoose.Schema({
   effectiveDate: { type: String, required: true }, // YYYY-MM-DD in business timezone
   sourceType: {
     type: String,
-    enum: ['attendance', 'manual-adjustment', 'leave', 'holiday', 'carry-forward'],
+    enum: ['attendance', 'manual-adjustment', 'leave', 'holiday', 'carry-forward', 'absence', 'payout'],
     required: true,
   },
   sourceId: { type: String, required: true },
