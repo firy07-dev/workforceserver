@@ -527,16 +527,16 @@ router.delete('/employees/:id', auth, admin, async (req, res) => {
       return res.status(404).send({ error: 'Employee not found' });
     }
 
-    const [attendanceCount, leaveCount] = await Promise.all([
-      Attendance.countDocuments({ userId: employee._id }),
-      LeaveRequest.countDocuments({ userId: employee._id }),
-    ]);
+    const Notification = require('../models/Notification');
 
-    if (attendanceCount > 0 || leaveCount > 0) {
-      return res.status(400).send({
-        error: 'This employee already has attendance or leave records. Disable the account instead of deleting it.',
-      });
-    }
+    // Cascade delete all records associated with this employee
+    await Promise.all([
+      Attendance.deleteMany({ userId: employee._id }),
+      LeaveRequest.deleteMany({ userId: employee._id }),
+      TimeBankEntry.deleteMany({ userId: employee._id }),
+      PayoutRequest.deleteMany({ userId: employee._id }),
+      Notification.deleteMany({ userId: employee._id }),
+    ]);
 
     await User.findByIdAndDelete(employee._id);
     res.send({ ok: true });
