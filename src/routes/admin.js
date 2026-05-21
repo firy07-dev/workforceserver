@@ -541,6 +541,7 @@ router.delete('/employees/:id', auth, admin, async (req, res) => {
     await User.findByIdAndDelete(employee._id);
     res.send({ ok: true });
   } catch (error) {
+    console.error('Delete Employee Route Error:', error);
     res.status(400).send({ error: error.message || 'Failed to delete employee' });
   }
 });
