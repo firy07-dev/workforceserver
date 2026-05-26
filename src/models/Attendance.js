@@ -45,6 +45,7 @@ const AttendanceSchema = new mongoose.Schema({
   totalHours: { type: Number, default: 0 }, // In minutes
   overtime: { type: Number, default: 0 }, // In minutes
   shortHours: { type: Number, default: 0 }, // In minutes
+  targetDailyMinutes: { type: Number }, // In minutes
   shortHoursReason: { type: String, default: '' },
   manualEntry: { type: Boolean, default: false },
   manualReason: { type: String, default: '' },

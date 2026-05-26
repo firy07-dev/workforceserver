@@ -10,6 +10,7 @@ const {
   calculateAttendanceTotals,
   getScheduleMode,
   getEmployeeDailyTargetMinutes,
+  getEmployeeWeeklyTargetMinutes,
 } = require('../utils/attendancePolicy');
 const {
   syncAttendanceLedgerEntry,
@@ -395,6 +396,7 @@ router.post('/clock-out', auth, async (req, res) => {
     record.totalHours = totals.workingMinutes;
     record.overtime = totals.overtime;
     record.shortHours = totals.shortHours;
+    record.targetDailyMinutes = getEmployeeDailyTargetMinutes(req.user, settings, now);
     if (typeof req.body.shortHoursReason === 'string') {
       record.shortHoursReason = req.body.shortHoursReason.trim();
     }
@@ -447,7 +449,10 @@ router.post('/clock-out', auth, async (req, res) => {
 
 // History
 router.get('/history', auth, async (req, res) => {
-  const history = await Attendance.find({ userId: req.user._id }).sort({ date: -1 }).lean();
+  const [history, settings] = await Promise.all([
+    Attendance.find({ userId: req.user._id }).sort({ date: -1 }).lean(),
+    ensureSettings(),
+  ]);
   
   const processedHistory = history.map(rec => {
     const autoLunchMinutes = rec.breaks?.reduce((total, br) => {
@@ -460,9 +465,25 @@ router.get('/history', auth, async (req, res) => {
       return total;
     }, 0) || 0;
 
+      const isWeekend = DateTime.fromISO(rec.date).weekday > 5;
+      let target = rec.targetDailyMinutes;
+      if (target === 0 && !isWeekend) {
+        target = null; // Fix for records created with the default 0 bug today
+      }
+
+      if (target == null) {
+        if (!rec.clockOut?.time && rec.status !== 'absent') {
+          target = getEmployeeDailyTargetMinutes(req.user, settings, rec.date);
+        } else {
+          target = isWeekend ? 0 : (settings.dailyMinutes || 493);
+          Attendance.updateOne({ _id: rec._id }, { $set: { targetDailyMinutes: target } }).exec();
+        }
+      }
+
     return {
       ...rec,
       autoLunchMinutes: Math.round(autoLunchMinutes),
+        targetDailyMinutes: target,
     };
   });
 

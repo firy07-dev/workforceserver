@@ -7,6 +7,7 @@ const LeaveRequest = require('../models/LeaveRequest');
 const TimeBankEntry = require('../models/TimeBankEntry');
 const Setting = require('../models/Setting');
 const Holiday = require('../models/Holiday');
+const mongoose = require('mongoose');
 const PayoutRequest = require('../models/PayoutRequest');
 const { DateTime } = require('luxon');
 const { notifyUserById } = require('../utils/pushNotifications');
@@ -15,6 +16,7 @@ const {
   calculateAttendanceTotals,
   getScheduleMode,
   getEmployeeDailyTargetMinutes,
+  getEmployeeWeeklyTargetMinutes,
 } = require('../utils/attendancePolicy');
 const {
   syncAttendanceLedgerEntry,
@@ -134,6 +136,9 @@ const markEmployeeAbsent = async ({ userId, date, adminId }) => {
     throw error;
   }
 
+  const settings = await ensureSettings();
+  const targetDailyMinutes = getEmployeeDailyTargetMinutes(employee, settings, targetDate);
+
   const absentRecord = new Attendance({
     userId: employee._id,
     date: targetDate,
@@ -143,6 +148,7 @@ const markEmployeeAbsent = async ({ userId, date, adminId }) => {
     totalHours: 0,
     overtime: 0,
     shortHours: 0,
+    targetDailyMinutes,
     manualEntry: true,
     manualReason: 'Manually marked as absent by admin.',
     manualCreatedBy: adminId,
@@ -564,6 +570,9 @@ router.post('/employees/:id/mark-absent', auth, admin, async (req, res) => {
 
 router.get('/employees/:id/overview', auth, admin, async (req, res) => {
   try {
+    if (!mongoose.Types.ObjectId.isValid(req.params.id)) {
+      return res.status(400).send({ error: 'Invalid employee ID format' });
+    }
     const employee = await User.findById(req.params.id).select('-password');
     if (!employee || employee.role !== 'employee') {
       return res.status(404).send({ error: 'Employee not found' });
@@ -600,6 +609,8 @@ router.get('/employees/:id/overview', auth, admin, async (req, res) => {
     const totalWorkedMinutes = monthlyAttendance.reduce((sum, item) => sum + (item.totalHours || 0), 0);
     const pendingLeaves = monthlyLeaves.filter((item) => item.status === 'pending').length;
     const approvedLeaves = monthlyLeaves.filter((item) => item.status === 'approved').length;
+    const dailyTargetMinutes = getEmployeeDailyTargetMinutes(employee, settings, now.toISODate());
+    const weeklyTargetMinutes = getEmployeeWeeklyTargetMinutes(employee, settings);
 
     const leaveBreakdown = ['vacation', 'sick', 'compOff', 'emergency', 'other'].map((type) => ({
       type,
@@ -669,12 +680,29 @@ router.get('/employees/:id/overview', auth, admin, async (req, res) => {
         return total;
       }, 0) || 0;
 
-      const shortfall = Math.max(0, getEmployeeDailyTargetMinutes(employee, settings, rec.date) - (rec.totalHours || 0));
+      const isWeekend = DateTime.fromISO(rec.date).weekday > 5;
+      let target = rec.targetDailyMinutes;
+      if (target === 0 && !isWeekend) {
+        target = null; // Fix for records created with the default 0 bug today
+      }
+
+      if (target == null) {
+        if (!rec.clockOut?.time && rec.status !== 'absent') {
+          target = getEmployeeDailyTargetMinutes(employee, settings, rec.date);
+        } else {
+          // Auto-heal older records: Assume 100% standard target before today's change
+          target = isWeekend ? 0 : (settings.dailyMinutes || 493);
+          Attendance.updateOne({ _id: rec._id }, { $set: { targetDailyMinutes: target } }).exec();
+        }
+      }
+
+      const shortfall = Math.max(0, target - (rec.totalHours || 0));
 
       return {
         ...rec,
         autoLunchMinutes: Math.round(autoLunchMinutes),
         shortfall: Math.round(shortfall),
+        targetDailyMinutes: target,
       };
     });
 
@@ -687,6 +715,11 @@ router.get('/employees/:id/overview', auth, admin, async (req, res) => {
         timeBankBalanceMinutes,
         pendingLeaves,
         approvedLeaves,
+        dailyTargetMinutes: getEmployeeDailyTargetMinutes(employee, settings),
+        weeklyTargetMinutes: getEmployeeWeeklyTargetMinutes(employee, settings),
+        dailyTargetMinutes,
+        weeklyTargetMinutes,
+        scheduleMode: getScheduleMode(settings),
       },
       workHoursSeries,
       leaveBreakdown,
@@ -782,6 +815,60 @@ router.patch('/attendance/:id', auth, admin, async (req, res) => {
     res.send(attendance);
   } catch (error) {
     res.status(400).send({ error: error.message || 'Failed to update attendance' });
+  }
+});
+
+router.post('/attendance/calculate', auth, admin, async (req, res) => {
+  try {
+    const { userId, date, clockInTime, clockOutTime, lunchMinutes } = req.body || {};
+    if (!userId) {
+      return res.status(400).send({ error: 'userId is required' });
+    }
+    if (!date) {
+      return res.status(400).send({ error: 'date is required' });
+    }
+    if (!clockInTime || !clockOutTime) {
+      return res.status(400).send({ error: 'clockInTime and clockOutTime are required' });
+    }
+
+    const employee = await User.findById(userId);
+    if (!employee || employee.role !== 'employee') {
+      return res.status(404).send({ error: 'Employee not found' });
+    }
+
+    const settings = await ensureSettings();
+    const targetClockIn = parseDateTimeInput(date, clockInTime);
+    let targetClockOut = parseDateTimeInput(date, clockOutTime);
+
+    if (targetClockOut < targetClockIn) {
+      if (getScheduleMode(settings) === 'flexible') {
+        targetClockOut = targetClockOut.plus({ days: 1 });
+      } else {
+        return res.status(400).send({ error: 'Clock-out cannot be earlier than clock-in' });
+      }
+    }
+
+    const normalizedLunch = Number.isFinite(Number(lunchMinutes))
+      ? Math.max(0, parseInt(lunchMinutes, 10))
+      : settings.lunchMinimumMinutes || 30;
+    const totals = calculateManualAttendance({
+      employee,
+      clockInTime: targetClockIn,
+      clockOutTime: targetClockOut,
+      lunchMinutes: normalizedLunch,
+      settings,
+    });
+
+    res.send({
+      ...totals,
+      targetDailyMinutes: getEmployeeDailyTargetMinutes(employee, settings, date),
+      targetWeeklyMinutes: getEmployeeWeeklyTargetMinutes(employee, settings),
+      contractPercentage: employee.contractPercentage || 100,
+      scheduleMode: getScheduleMode(settings),
+    });
+  } catch (error) {
+    console.error('Manual attendance calculate error:', error);
+    res.status(400).send({ error: error.message || 'Failed to calculate attendance' });
   }
 });
 
@@ -885,6 +972,7 @@ router.post('/attendance/manual', auth, admin, async (req, res) => {
       attendance.totalHours = workingMinutes;
       attendance.overtime = overtime;
       attendance.shortHours = shortHours;
+      attendance.targetDailyMinutes = getEmployeeDailyTargetMinutes(employee, settings, attendanceDate);
     } else {
       attendance.clockOut = undefined;
       attendance.breaks = [];
