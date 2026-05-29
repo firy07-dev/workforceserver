@@ -328,6 +328,9 @@ router.post('/clock-in', auth, async (req, res) => {
     res.status(201).send(record);
   } catch (error) {
     console.error('Clock-in error:', error);
+    if (error.code === 11000) {
+      return res.status(400).send({ error: 'Already clocked in today' });
+    }
     res.status(400).send({ error: error.message || 'Failed to clock in' });
   }
 });
